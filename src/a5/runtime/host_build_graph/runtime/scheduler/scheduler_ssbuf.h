@@ -40,7 +40,7 @@ struct alignas(64) SchedulerSsbufHeader {
 struct alignas(32) SchedulerSsbufDispatchControl {
     // Low 32 bits: ready generation; high 32 bits: signed timing slot.
     volatile uint64_t publication;
-    int64_t task_id;
+    int64_t task_ref;
     uint8_t reserved[16];
 };
 

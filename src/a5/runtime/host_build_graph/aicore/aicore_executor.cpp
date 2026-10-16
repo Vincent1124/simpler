@@ -156,15 +156,15 @@ __aicore__ bool bootstrap_ready_graph(
         scheduler->config.scheduler_index * tasks_per_scheduler +
         (scheduler->config.scheduler_index < remainder ? scheduler->config.scheduler_index : remainder);
     uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->config.scheduler_index < remainder ? 1 : 0);
-    for (uint64_t task_id = task_begin; task_id < task_end; ++task_id) {
+    for (uint64_t task_ref = task_begin; task_ref < task_end; ++task_ref) {
         __gm__ SchedulerTaskMetadata *metadata =
-            scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_id));
+            scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref));
         scheduler_observe_cache_line(metadata);
         if (!scheduler_task_is_executable(metadata->flags)) continue;
         const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
         SchedulerRouteResult route =
             has_fanin ? scheduler_bootstrap_route_task(
-                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_id),
+                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref),
                             phase_timing_enabled ? &stats->wake : nullptr
                         ) :
                         SchedulerRouteResult::READY_TO_ENQUEUE;
@@ -172,7 +172,7 @@ __aicore__ bool bootstrap_ready_graph(
         if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
             const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
             if (!scheduler_bootstrap_ready_batch_append(
-                    scheduler_state_base, scheduler, static_cast<int64_t>(task_id), &batches[core_type],
+                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type],
                     phase_timing_enabled ? &stats->ready : nullptr, profiling_level
                 ))
                 return false;
@@ -205,7 +205,7 @@ __aicore__ bool bootstrap_ready_graph(
                     barrier_start, scheduler_cycles(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
                 )) {
                 scheduler_record_error(
-                    run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
+                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
                     SchedulerErrorSite::BOOTSTRAP_SCAN_TIMEOUT
                 );
                 return false;
@@ -315,7 +315,7 @@ __aicore__ bool run_ready_dispatch_loop(
         bool scheduler_progress = false;
         if (scheduler_worker && !scheduler_refresh_ready_inbox(scheduler_state_base, context)) {
             scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::READY_INBOX_REFRESH_FAILED
             );
             return false;
@@ -400,7 +400,7 @@ __aicore__ bool run_ready_dispatch_loop(
                     scheduler_dispatch_generation(local_generation) == 0 ||
                     scheduler_dispatch_generation(local_generation) != next_dispatch_sequence) {
                     scheduler_record_error(
-                        run_control, context->slots[cluster_lane][local_slot].task_id,
+                        run_control, context->slots[cluster_lane][local_slot].task_ref,
                         SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                         SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
                     );
@@ -447,10 +447,10 @@ __aicore__ bool run_ready_dispatch_loop(
                 scheduler_observe_dispatch_payload_arguments(payload);
                 scheduler_observe_dispatch_payload_barrier();
             }
-            const int64_t task_id = scheduler_worker ? local_slot->task_id : ssbuf_control->task_id;
-            if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count || ready_generation == 0) {
+            const int64_t task_ref = scheduler_worker ? local_slot->task_ref : ssbuf_control->task_ref;
+            if (!scheduler_task_ref_valid(graph, task_ref) || ready_generation == 0) {
                 scheduler_record_error(
-                    run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
                 );
                 return false;
@@ -555,7 +555,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);
     if (!config_valid)
         scheduler_record_error(
-            run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
             SchedulerErrorSite::BOOTSTRAP_FAILED
         );
     const uint32_t cluster_lane = scheduler_local_state.config.self_lane;
@@ -573,7 +573,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                 scheduler_local_state.config.scheduler_count, &stats, profiling_level, &deferred_aiv, ssbuf_region
             )) {
             scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::BOOTSTRAP_FAILED
             );
         }
@@ -589,7 +589,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                 register_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
             )) {
             scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
                 SchedulerErrorSite::REGISTER_RELEASE_TIMEOUT
             );
             register_release_timed_out = true;
@@ -614,7 +614,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || scheduler_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
                 !scheduler_ssbuf_is_initialized(ssbuf_region, scheduler_lane)) {
                 scheduler_record_error(
-                    run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
                 );
             } else {
@@ -636,7 +636,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                 exit_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
             )) {
             scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
                 SchedulerErrorSite::EXIT_WAIT_TIMEOUT
             );
             break;
@@ -744,8 +744,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 scheduler_gm_query(pending_run_control->scheduler_timeout_cycles)
             )) {
             scheduler_record_error(
-                pending_run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, nullptr, pending_context,
-                SchedulerErrorSite::CONTEXT_READY_TIMEOUT
+                pending_run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, nullptr,
+                pending_context, SchedulerErrorSite::CONTEXT_READY_TIMEOUT
             );
             startup_signal = AICORE_EXIT_SIGNAL;
             break;
