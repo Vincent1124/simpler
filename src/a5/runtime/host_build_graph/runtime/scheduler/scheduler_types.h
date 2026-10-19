@@ -646,12 +646,6 @@ inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
 inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
-// How many Schedulers the state is addressed for. One per worker: a Scheduler
-// owns the slots of exactly one core, so the identity is a worker id rather than
-// a cluster index. The ready inboxes and the bootstrap-ready bitmap were already
-// sized by SCHEDULER_WORKER_CAPACITY, so widening this changes the directory's
-// shard count and the bounds checks, not any array's footprint.
-inline constexpr uint32_t SCHEDULER_CAPACITY = static_cast<uint32_t>(SCHEDULER_WORKER_CAPACITY);
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
 inline constexpr uint64_t SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL = 2;
@@ -929,7 +923,6 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_READY_PUBLISH_FAILED = 66,
     COMPLETION_INVALID_SHAPE = 67,
     COMPLETION_RESOLVE_FAILED = 68,
-    COMPLETION_REFILL_CLAIM_FAILED = 69,
     COMPLETION_REFILL_DISPATCH_FAILED = 70,
     COMPLETION_GENERATION_MISMATCH = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
@@ -1053,7 +1046,6 @@ struct alignas(128) SchedulerWorkerContext {
     // bound available here: the scheduler state reserves no callable array.
     volatile uint64_t callable_addresses_address;
     volatile uint64_t runtime_worker_count;
-    volatile uint64_t bootstrap_done;
     uint64_t bootstrap_scan_end_cycles;
     uint64_t target_bootstrap_start_cycles;
     uint64_t target_bootstrap_end_cycles;
@@ -1062,12 +1054,11 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t callable_addresses_count;
     uint64_t bootstrap_timing_reserved;
 
-    volatile uint64_t graph_summary_offset;
+    alignas(128) volatile uint64_t graph_summary_offset;
     volatile uint64_t scheduler_count;
     volatile uint64_t cluster_count;
     volatile uint64_t cluster_index;
     volatile uint64_t scheduler_index;
-    volatile uint64_t scheduler_worker_id;
     volatile uint64_t is_scheduler;
     volatile uint64_t cluster_worker_ids[3];
     // Mix slots' payloads and executor traces, both addressed by the holding
@@ -1185,7 +1176,6 @@ static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout change
 static_assert(alignof(SchedulerGraphSummary) == 128, "graph summary alignment changed");
 static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
-static_assert(SCHEDULER_CAPACITY <= SCHEDULER_WORKER_CAPACITY, "scheduler capacity exceeds worker storage");
 static_assert(
     SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >=
         scheduler_ready_queue_capacity(1),
@@ -1378,7 +1368,6 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         contexts[worker].physical_core_id = -1;
         contexts[worker].cluster_index = UINT64_MAX;
         contexts[worker].scheduler_index = UINT64_MAX;
-        contexts[worker].scheduler_worker_id = UINT64_MAX;
         contexts[worker].activity_buffers_offset = layout.activity_buffers_offset;
         contexts[worker].cluster_worker_ids[0] = UINT64_MAX;
         contexts[worker].cluster_worker_ids[1] = UINT64_MAX;
