@@ -7,17 +7,20 @@
 1. 阅读仓库根目录的 `AGENTS.md`、`CLAUDE.md` 及适用规则。
 2. 阅读 [共同背景](shared-context.md)。
 3. 阅读根目录的 [D5-issue](../../D5-issue.md) 和 [设计文档](../../simpler-pr-1.1-design.md)。
-4. 阅读 [agent A 评审](agent-a-review.md) 与 [agent B 评审](agent-b-review.md)。
+4. 阅读 [agent-gpt 评审](agent-gpt-review.md) 与 [agent-deepseek 评审](agent-deepseek-review.md)。
+
+给另一个环境的完整任务指令见 [agent-deepseek prompt](prompt-agent-deepseek.md)，可直接复制发送。
 
 ## 文件职责
 
 | 文件 | 用途 | 修改约定 |
 | --- | --- | --- |
 | `shared-context.md` | 基线、范围、审阅问题和同步约定 | 修改时说明依据，不将争议结论写成事实 |
-| `agent-a-review.md` | 当前 Codex 环境的判断和证据 | agent A 维护 |
-| `agent-b-review.md` | 另一个环境的独立判断和逐项回应 | agent B 维护 |
+| `agent-gpt-review.md` | 当前 Codex 环境的判断和证据 | agent-gpt 维护 |
+| `agent-deepseek-review.md` | 另一个环境的独立判断和逐项回应 | agent-deepseek 维护 |
+| `prompt-agent-deepseek.md` | 可直接发送给 agent-deepseek 的任务指令 | 任务范围变化时同步维护 |
 
-agent A/B 只表示记录归属，不表示判断优先级。Git 历史保留各次意见，不应覆盖另一方文件来消除分歧。需要引用另一方意见时，注明文件和条目编号。
+agent-gpt / agent-deepseek 只表示记录归属，不表示判断优先级。Git 历史保留各次意见，不应覆盖另一方文件来消除分歧。需要引用另一方意见时，注明文件和条目编号。
 
 ## 同步方法
 
@@ -34,7 +37,7 @@ git pull --ff-only origin mdtest
 每次回应需要写明审阅的文档提交、产品代码提交以及实际检查方式。只暂存本次负责的文件：
 
 ```bash
-git add agent-context/d5-review/agent-b-review.md
+git add agent-context/d5-review/agent-deepseek-review.md
 git diff --cached --check
 git diff --cached
 git commit -m "Update: record independent D5 review findings"
