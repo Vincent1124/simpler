@@ -1,6 +1,13 @@
 # 用户范围与边界决策
 
-文件名按用户指定的 `user-decison` 保留。本文件只承载需要用户定义的功能范围，不承载应由 agent 调查的代码事实或技术方案。
+文件名按用户指定的 `user-decison` 保留。本文件承载确实需要用户定义的功能范围，并列明已有代码与 PR-list 能回答的部分，避免将已确定行为重复交给用户选择。代码事实和实现机制由 agent 调查，不要求用户代做技术判断。
+
+## 依据范围
+
+- 现有实现：本次 PR 的固定提交 `77b2f85618dc06ff7e8a32b42cbdbce3dfe4dafc`，不是 `mdtest` 分支的旧产品代码。
+- 预期实现：[PR-list](https://icc.gt.tc/comm-pr?i=2) 的 1.1、1.3、1.4 展开说明；2026-10-20 已重新成功获取页面，不再仅依赖此前缓存。
+- 以下 UD1、UD2 的判断依据仅来自上述代码与 PR-list。双方评审或配套设计文档不作为要求来源。
+- “代码已经这样实现”不等于证明实现合理；“清单没有明确要求”也不等于禁止后续扩展。是否构成缺陷仍需对照已确认契约与安全性检查。
 
 ## 已明确的目标
 
@@ -23,7 +30,26 @@
 
 ## UD1：同一 owner 内的故障隔离要求
 
-状态：待用户定义。尚未选择任何选项。
+状态：代码已明确采用 UD1-A；PR-list 未明确规定必须采用 A 或 B。若希望扩展到 UD1-B，才需要进一步确认范围。这里记录实现事实，不代表用户已经批准该策略。
+
+### UD1 的现有实现依据
+
+| 来源 | 代码行为 | 能得到的回答 |
+| --- | --- | --- |
+| [`worker.py:6456-6464`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/worker.py#L6456-L6464)，`_expire_mpi_group_session_locked` | group 失效后设置 owner Worker 的 `_mpi_session_failure`，并使 registry 失效 | 故障准入范围提升到该 Worker，而非仅记录涉事 group |
+| [`worker.py:6414-6419`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/worker.py#L6414-L6419)，`_require_no_mpi_session_failure_locked` | 字段非空则拒绝，要求关闭 Worker；不按本次操作属于 A 或 B 区分 | B 即使仍 ACTIVE，也不能绕过 owner 故障门禁 |
+| [`worker.py:7709-7715`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/worker.py#L7709-L7715)，`_operation_lease` | 普通操作准入调用上述检查 | 当前采用 owner 范围停止普通新工作，即 UD1-A |
+
+### UD1 的 PR-list 预期依据
+
+| 来源 | 清单要求 | 可以与不可以推导的结论 |
+| --- | --- | --- |
+| [1.1 展开说明](https://icc.gt.tc/comm-pr?i=2) | 关联 MPI 身份与既有 registry，定清失效边界；建议以固定成员、整组重启为前提讨论独立 epoch 是否必要 | 要求明确失效边界；没有明确要求同 owner 内的健康 group 必须继续，也不能将整组重启解释为所有 group 必须一起停止 |
+| [1.3 展开说明](https://icc.gt.tc/comm-pr?i=2) | 物理设备独占、lease、能力清点冻结一致性，解决同一物理卡被不同 session 声明的问题 | 没有明确把同 owner 部分存活或热迁移列为必须能力，不能据此判定 UD1-A 违反 1.3 |
+
+结论：现有实现回答了“目前怎么做”，PR-list 尚未在 UD1-A、UD1-B 之间规定唯一答案。无需用户重新定义现状，也无需等待该扩展选择才能继续排查确定的代码缺陷。
+
+### UD1 的场景与扩展选项
 
 场景：同一个 Worker 已完成初始化，管理 MPI group A、B。A 的故障已被观察并发布；B 的成员与通信仍正常。是否能够证明 B 与 A 的故障无关，需要技术验证，不以“配置成两个 group”替代。
 
@@ -41,13 +67,31 @@
 - 本项不自动承诺 A 原地重连、同一 MPI group 内部分 rank 存活或热迁移，也不保证已经开始的事务继续，后者见 UD2。
 - 不能将初始化期间尚未 READY 的 group 当作运行中的健康 group，要求它承接新任务。
 
-用户决定：待填写。
+用户对是否新增 UD1-B 能力的决定：待明确；未将当前代码行为代填为用户决定。
 
 若选择新增隔离能力，其交付安排：待明确是纳入当前 1.1 修复，还是列入后续工作；不能仅凭功能期望自动扩大本 PR。
 
 ## UD2：无关变化发生时，已开始事务是否需要继续
 
-状态：待用户定义。尚未选择任何选项。
+状态：代码只提供旧 registry 拒绝机制，尚无完整的事务级 epoch 关联；PR-list 明确安全要求，但未规定无关事务一律中止或必须继续。UD2-A、UD2-B 均不能标为已有完整实现。
+
+### UD2 的现有实现依据
+
+| 来源 | 代码行为 | 能得到的回答 |
+| --- | --- | --- |
+| [`worker.py:7731-7734`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/worker.py#L7731-L7734)，`_invalidate_endpoint_registry` | 清缓存并增加全局 `_endpoint_registry_epoch` | owner 的 registry 版本已改变 |
+| [`worker.py:7913-7928`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/worker.py#L7913-L7928)，`_validate_endpoint_registry_snapshot` | 旧 epoch 快照被拒绝，owner MPI 故障另行拒绝 | 到达该校验点的旧 registry 不能继续被授权，但不能据此证明所有事务已经按协议中止 |
+| [`global_comm_domain.py:204-215`](https://github.com/Vincent1124/simpler/blob/77b2f856/python/simpler/global_comm_domain.py#L204-L215)，`GlobalDomainCommand` | 含域 `generation`，没有 registry epoch 字段 | 尚未将 registry 版本关联完整表达为事务命令契约，无法据此认定当前完整采用 UD2-A 或 UD2-B |
+
+### UD2 的 PR-list 预期依据
+
+来源：[1.4 展开说明](https://icc.gt.tc/comm-pr?i=2)。清单要求将成员事务接到会话身份上，补失败与重连验证；指出命令只有域 generation，缺少 registry epoch 关联，跨代 COMMIT 缺少拦截。同时要求保留已有四阶段和全部 IMPORT 成功后 COMMIT 的机制，不重做它们。
+
+可以确定的预期是：补充会话/registry 身份关联验证，阻止失效代际的 COMMIT。不能从该要求直接推导出“无关事务必须保留进展”，也不能推导出“所有无关事务必须一律中止”。清单未明确选择 UD2-A 或 UD2-B。
+
+结论：当前安全机制只有部分依据，完整事务契约是后续 1.4 要补的能力；保留独立事务进展属于尚未明确规定的可用性要求，不应阻塞当前 1.1 缺陷排查。
+
+### UD2 的场景与扩展选项
 
 场景：事务 T 只依赖 B，已经开始 PREPARE/IMPORT、尚未完成提交。另一项变化使全局 registry epoch 改变，但经验证 T 的成员与资源依赖仍然有效，且 owner 仍允许执行该事务。
 
@@ -76,7 +120,7 @@
 | UD1-B + UD2-B | 健康 group 的新工作和依赖未变的未完成事务均可在验证后继续 |
 | UD1-A + UD2-B | owner 故障拒绝仍优先；事务继续能力只适用于 owner 未被故障门禁阻止的无关变化，不能用来绕过 UD1-A |
 
-用户决定：待填写。
+用户对是否要求 UD2-B 保留独立事务进展的决定：待明确；未将尚未完成的事务契约标为已经实现或已经验收。
 
 若选择保留独立事务进展，其交付安排：待明确对应后续 1.4 的验收要求，及当前 1.1 需要保留的扩展接口；不在本文件代定具体实现。
 
