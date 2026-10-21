@@ -1,47 +1,94 @@
-(.venv) [l00896871@master37 simpler]$ python -m pytest -q \
-> tests/ut/py/test_mpi_session_epoch.py \
-> tests/ut/py/test_mpi_l3_group.py \
-> tests/ut/py/test_worker/test_comm_endpoints.py \
-> tests/ut/py/test_worker/test_comm_region.py 
-....................................................................................................................................................................F.......                                                                                                                [100%]
-============================================================================================================================================ FAILURES =============================================================================================================================================
-_______________________________________________________________________________________________________________ test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing ________________________________________________________________________________________________________________
+(.venv) [l00896871@master37 simpler]$ python -m pytest tests/ut -q -ra \
+> --junitxml=pytest-ut-results.xml \
+> 2>&1 |tee pytest-ut.log
 
-    def test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing():
-        unsupported = _context(
-            _l3(device_ids=[0]),
-            [ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[0]", ce.DEVICE_AICPU)],
-            ce.SingleOwner(provider=ce.at("L3", ce.HOST_CPU)),
-        )
->       _assert_refusal(unsupported, RefusalReason.UNSUPPORTED_PLAN)
-
-tests/ut/py/test_worker/test_comm_region.py:401: 
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-tests/ut/py/test_worker/test_comm_region.py:104: in _assert_refusal
-    validate_single_owner_region_shape(ctx)
-python/simpler/comm_region.py:845: in validate_single_owner_region_shape
-    _validate_registry_matches_worker(ctx)
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
-
-ctx = MaterializationContext(worker=<simpler.worker.Worker object at 0xffff9ed60850>, registry=<simpler.comm_endpoints.Endpo...plicit transfer materializer is not implemented yet'),)), layout=RegionLayoutSpec(payload_bytes=64, counter_bytes=128))
-
-    def _validate_registry_matches_worker(ctx: MaterializationContext) -> None:
-        worker_instance_id = getattr(ctx.worker, "_owner_instance_id", None)
-        worker_epoch = getattr(ctx.worker, "_endpoint_registry_epoch", None)
-        if worker_instance_id != ctx.registry.session_instance_id or worker_epoch != ctx.registry.registry_epoch:
-            raise MaterializationRefusal(
-                RefusalReason.REGISTRY_MISMATCH,
-                "Region materialization requires a registry from the current worker endpoint epoch",
-            )
-        validator = getattr(ctx.worker, "_validate_endpoint_registry", None)
-        if callable(validator):
-            try:
-                validator(ctx.registry, ())
->               members = tuple(ctx.registry._record_for(identity) for identity in ctx.plan.ordered_members)
-                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
-E               AttributeError: 'UnsupportedRegionPlan' object has no attribute 'ordered_members'
-
-python/simpler/comm_region.py:1347: AttributeError
-===================================================================================================================================== short test summary info =====================================================================================================================================
-FAILED tests/ut/py/test_worker/test_comm_region.py::test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing - AttributeError: 'UnsupportedRegionPlan' object has no attribute 'ordered_members'
-1 failed, 171 passed in 1.25s
+==================================== ERRORS ====================================
+____________ ERROR collecting tests/ut/py/test_gcc_setup_action.py _____________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_gcc_setup_action.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_gcc_setup_action.py:19: in <module>
+    import yaml
+E   ModuleNotFoundError: No module named 'yaml'
+_______ ERROR collecting tests/ut/py/test_packaging_compiler_identity.py _______
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_packaging_compiler_identity.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_packaging_compiler_identity.py:15: in <module>
+    import yaml
+E   ModuleNotFoundError: No module named 'yaml'
+_______ ERROR collecting tests/ut/py/test_pre_commit_build_selection.py ________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_pre_commit_build_selection.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_pre_commit_build_selection.py:17: in <module>
+    import yaml
+E   ModuleNotFoundError: No module named 'yaml'
+________ ERROR collecting tests/ut/py/test_qwen_clone_worker_submit.py _________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_qwen_clone_worker_submit.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_qwen_clone_worker_submit.py:20: in <module>
+    from clone_worker_submit import (  # noqa: E402
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/clone_worker_submit.py:22: in <module>
+    from real_worker_submit import BATCH, PADDED_VOCAB, _bind, _view
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/real_worker_submit.py:19: in <module>
+    from safetensors.torch import load_file
+E   ModuleNotFoundError: No module named 'safetensors'
+______ ERROR collecting tests/ut/py/test_qwen_continuous_worker_submit.py ______
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_qwen_continuous_worker_submit.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_qwen_continuous_worker_submit.py:20: in <module>
+    from continuous_worker_submit import (  # noqa: E402
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/continuous_worker_submit.py:21: in <module>
+    from clone_worker_submit import _assert_disjoint_storage, _await_joined_evidence, _source_head
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/clone_worker_submit.py:22: in <module>
+    from real_worker_submit import BATCH, PADDED_VOCAB, _bind, _view
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/real_worker_submit.py:19: in <module>
+    from safetensors.torch import load_file
+E   ModuleNotFoundError: No module named 'safetensors'
+__________ ERROR collecting tests/ut/py/test_qwen_device_feedback.py ___________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_qwen_device_feedback.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_qwen_device_feedback.py:23: in <module>
+    import device_feedback_worker_submit as feedback  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/device_feedback_worker_submit.py:20: in <module>
+    from clone_worker_submit import (
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/clone_worker_submit.py:22: in <module>
+    from real_worker_submit import BATCH, PADDED_VOCAB, _bind, _view
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/real_worker_submit.py:19: in <module>
+    from safetensors.torch import load_file
+E   ModuleNotFoundError: No module named 'safetensors'
+_________ ERROR collecting tests/ut/py/test_qwen_reference_contract.py _________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_qwen_reference_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_qwen_reference_contract.py:16: in <module>
+    from safetensors.torch import save_file
+E   ModuleNotFoundError: No module named 'safetensors'
+________ ERROR collecting tests/ut/py/test_qwen_resident_kv_lifetime.py ________
+ImportError while importing test module '/home/l00896871/pypto-work/simpler/tests/ut/py/test_qwen_resident_kv_lifetime.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/ut/py/test_qwen_resident_kv_lifetime.py:21: in <module>
+    import reference_worker_submit as consumer  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/reference_worker_submit.py:22: in <module>
+    from real_worker_submit import (
+examples/a2a3/host_build_graph/qwen3_14b_serving_effective/real_worker_submit.py:19: in <module>
+    from safetensors.torch import load_file
+E   ModuleNotFoundError: No module named 'safetensors'
+=========================== short test summary info ============================
+ERROR tests/ut/py/test_gcc_setup_action.py
+ERROR tests/ut/py/test_packaging_compiler_identity.py
+ERROR tests/ut/py/test_pre_commit_build_selection.py
+ERROR tests/ut/py/test_qwen_clone_worker_submit.py
+ERROR tests/ut/py/test_qwen_continuous_worker_submit.py
+ERROR tests/ut/py/test_qwen_device_feedback.py
+ERROR tests/ut/py/test_qwen_reference_contract.py
+ERROR tests/ut/py/test_qwen_resident_kv_lifetime.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 8 errors during collection !!!!!!!!!!!!!!!!!!!!
+8 errors in 8.30s
