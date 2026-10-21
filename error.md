@@ -1,4 +1,24 @@
 (.venv) [l00896871@master37 simpler]$ python -m pytest tests/ut -q -ra --junitxml=pytest-ut-results.xml 2>&1 |tee pytest-ut.log
+^C^[[A^C^X^Z
+[3]+  已停止               python -m pytest tests/ut -q -ra --junitxml=pytest-ut-results.xml 2>&1 | tee pytest-ut.log
+(.venv) [l00896871@master37 simpler]$ python -m pip install --no-build-isolation -e .
+Looking in indexes: http://mirrors.tools.huawei.com/pypi/simple
+Obtaining file:///home/l00896871/pypto-work/simpler
+  Checking if build backend supports build_editable ... done
+  Preparing editable metadata (pyproject.toml) ... done
+Requirement already satisfied: cloudpickle>=2.2 in /home/l00896871/pypto-work/.venv/lib64/python3.11/site-packages (from simpler==0.1.0) (3.1.2)
+Building wheels for collected packages: simpler
+  Building editable for simpler (pyproject.toml) ... done
+  Created wheel for simpler: filename=simpler-0.1.0-cp311-cp311-linux_aarch64.whl size=47519905 sha256=66f8dd055dec61d361a59f3ac627dafe77226dbcd3fc2eb0c7c932f8663d713e
+  Stored in directory: /tmp/pip-ephem-wheel-cache-nm7ru6bi/wheels/85/d9/92/eb173c1284844380e70da926ccccfbae886ebb64a80455205f
+Successfully built simpler
+Installing collected packages: simpler
+  Attempting uninstall: simpler
+    Found existing installation: simpler 0.1.0
+    Uninstalling simpler-0.1.0:
+      Successfully uninstalled simpler-0.1.0
+Successfully installed simpler-0.1.0
+(.venv) [l00896871@master37 simpler]$ python -m pytest tests/ut -q -ra --junitxml=pytest-ut-results.xml 2>&1 |tee pytest-ut.log
 ........................................................................ [  1%]
 ........................................................................ [  3%]
 ........................................................................ [  5%]
@@ -8,12 +28,12 @@ ssssssssss.............................................................. [  9%]
 ........................................................................ [ 13%]
 ........................................................................ [ 15%]
 ........................................................................ [ 17%]
-.............................................F......................ss.. [ 19%]
+....................................................................ss.. [ 19%]
 ss.............ssssssssssss..............................ssssssssss..... [ 21%]
 ...ssssssssssssssssssssssssssss.ssssssssssssssss........ssssssss........ [ 23%]
 ssss.................................................................... [ 25%]
 ...........................................sssssss...................... [ 27%]
-........................................................................ [ 29%]
+.......................................F................................ [ 29%]
 ...................ssss................................................. [ 31%]
 ........................................................................ [ 33%]
 ........................................................................ [ 35%]
@@ -37,7 +57,7 @@ ssss.................................................................... [ 25%]
 ........................................................................ [ 70%]
 ........................................................................ [ 72%]
 ........................................................................ [ 74%]
-....................F................................................... [ 76%]
+........................................................................ [ 76%]
 ......................................................ssss.............. [ 78%]
 ...s.................................................................... [ 80%]
 ........................................................................ [ 82%]
@@ -52,123 +72,38 @@ ssss.................................................................... [ 25%]
 .........................................ssssssssssssssssssssssss....... [ 99%]
 .....                                                                    [100%]
 =================================== FAILURES ===================================
-__ test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import ___
+____ test_registry_view_rejects_old_session_with_current_directory_version _____
 
-monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xfffe366db390>
+session = (<simpler.worker.Worker object at 0xfffe8564a6d0>, _MpiL3GroupRuntime(group_id='988f8d8e9cd148aebaafaed2dafcce2a', spe... <test_mpi_l3_group._FakeProcess object at 0xfffe85649c90>, <test_mpi_l3_group._ReadyMailbox object at 0xfffe8564a0d0>)
 
-    def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(monkeypatch):
-        from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
-        from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+    def test_registry_view_rejects_old_session_with_current_directory_version(session):
+        worker, group, _process, _mailbox = session
+        registry = worker._get_endpoint_registry()
+        views = [registry.mpi_session_for_endpoint(record) for record in registry.records]
+        assert {view.session_epoch for view in views if view is not None} == {1}
+        worker._validate_endpoint_registry(registry, registry.records)
+        worker._invalidate_endpoint_registry()
+        current = worker._get_endpoint_registry()
+        assert group.session_epoch == 1
+        with pytest.raises(ce.EndpointResolveError) as old_directory:
+            worker._validate_endpoint_registry(registry, registry.records)
+        assert old_directory.value.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
     
-        worker, resources, node_ids = _mpi_static_worker()
-        calls = []
-        commands = []
-    
-        def control(worker_id, control_name, payload, *, group=False):
-            control_name = ControlName(control_name)
-            if control_name is ControlName.COMM_INIT:
-                init = decode_comm_init(payload)
-                calls.append(("COMM_INIT", worker_id))
-                return encode_comm_init_result(
-                    resolve_global_comm_capability(
-                        platform="a2a3sim",
-                        profile=init.profile,
-                        local_device_count=1,
-                    )
-                )
-            assert control_name is ControlName.ALLOC_DOMAIN
-            command = decode_domain_command(payload)
-            commands.append(command)
-            calls.append((command.phase, worker_id))
-            if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
-                descriptors = tuple(
-                    GlobalDomainDescriptor(
-                        version=GLOBAL_DOMAIN_VERSION,
-                        profile_id=GLOBAL_DOMAIN_PROFILE_IDS[command.profile],
-                        domain_rank=member.domain_rank,
-                        rank_count=len(command.members),
-                        mapping_size=4096,
-                        handle=f"/mpi-prepared-{member.domain_rank}".encode(),
-                    )
-                    for member in command.members
-                )
-                return encode_descriptor_table(descriptors)
-            if command.phase is GlobalDomainPhase.IMPORT:
-                raise RuntimeError("L4 broker IMPORT should not run for a full mpirun group")
-            return b""
-    
-        monkeypatch.setattr(worker, "_global_domain_control", control)
-        try:
->           handle = worker._allocate_global_domain(
-                name="mpi-static",
-                members=((node_ids[0], 0), (node_ids[1], 0)),
-                window_size=4096,
-                buffers=[CommBufferSpec("payload", "uint8", 4096, 4096)],
-                retain_after_run=False,
-            )
-
-tests/ut/py/test_global_comm_domain.py:1523: 
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-python/simpler/worker.py:11503: in _allocate_global_domain
-    attachment_matrix = self._global_domain_attachment_matrix(
-python/simpler/worker.py:11017: in _global_domain_attachment_matrix
-    plan = resolver.plan(
-python/simpler/comm_endpoints.py:928: in plan
-    self._registry.require_mpi_sessions_available(members)
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-
-self = <simpler.comm_endpoints.EndpointRegistry object at 0xfffe5b631090>
-members = (EndpointRecord(identity=EndpointIdentity(session_instance_id=b'\x8cB\x80/\xd9V\x10\xfa', registry_epoch=1, endpoint_i...istry_epoch=1, endpoint_id=1), path='L4/L3[0]', deployment=<EndpointDeployment.HOST_CPU: 'HOST_CPU'>, node_scope_id=0))
-
-    def require_mpi_sessions_available(self, members: Sequence[EndpointRecord]) -> None:
-        """Check snapshot availability; only the owner can validate a live generation."""
-        for member in members:
-            view = self.mpi_session_for_endpoint(member)
-            if view is not None and not view.available:
->               raise EndpointResolveError(
-                    EndpointResolveReason.MPI_SESSION_UNAVAILABLE,
-                    f"MPI session for {member.path} is not observed available",
-                )
-E               simpler.comm_endpoints.EndpointResolveError: MPI session for L4/L3[0]/L2[0] is not observed available
-
-python/simpler/comm_endpoints.py:422: EndpointResolveError
-______ test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing ______
-
-    def test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing():
-        unsupported = _context(
-            _l3(device_ids=[0]),
-            [ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[0]", ce.DEVICE_AICPU)],
-            ce.SingleOwner(provider=ce.at("L3", ce.HOST_CPU)),
+        # A fault-injected generation change isolates epoch checking from directory invalidation.
+        group.session_epoch += 1
+        with pytest.raises(ce.EndpointResolveError) as old_session:
+            worker._validate_endpoint_registry(current, current.records)
+        assert old_session.value.reason is ce.EndpointResolveReason.MPI_SESSION_UNAVAILABLE
+        ctx = MaterializationContext(
+            worker=worker,
+            registry=current,
+            plan=cast(Any, SimpleNamespace(ordered_members=tuple(record.identity for record in current.records))),
+            layout=ce.RegionLayoutSpec(payload_bytes=64, counter_bytes=0),
         )
->       _assert_refusal(unsupported, RefusalReason.UNSUPPORTED_PLAN)
+>       with pytest.raises(MaterializationRefusal) as refusal:
+E       Failed: DID NOT RAISE MaterializationRefusal
 
-tests/ut/py/test_worker/test_comm_region.py:401: 
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-tests/ut/py/test_worker/test_comm_region.py:104: in _assert_refusal
-    validate_single_owner_region_shape(ctx)
-python/simpler/comm_region.py:845: in validate_single_owner_region_shape
-    _validate_registry_matches_worker(ctx)
-_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-
-ctx = MaterializationContext(worker=<simpler.worker.Worker object at 0xfffe535bb450>, registry=<simpler.comm_endpoints.Endpo...plicit transfer materializer is not implemented yet'),)), layout=RegionLayoutSpec(payload_bytes=64, counter_bytes=128))
-
-    def _validate_registry_matches_worker(ctx: MaterializationContext) -> None:
-        worker_instance_id = getattr(ctx.worker, "_owner_instance_id", None)
-        worker_epoch = getattr(ctx.worker, "_endpoint_registry_epoch", None)
-        if worker_instance_id != ctx.registry.session_instance_id or worker_epoch != ctx.registry.registry_epoch:
-            raise MaterializationRefusal(
-                RefusalReason.REGISTRY_MISMATCH,
-                "Region materialization requires a registry from the current worker endpoint epoch",
-            )
-        validator = getattr(ctx.worker, "_validate_endpoint_registry", None)
-        if callable(validator):
-            try:
-                validator(ctx.registry, ())
->               members = tuple(ctx.registry._record_for(identity) for identity in ctx.plan.ordered_members)
-                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
-E               AttributeError: 'UnsupportedRegionPlan' object has no attribute 'ordered_members'
-
-python/simpler/comm_region.py:1347: AttributeError
+tests/ut/py/test_mpi_session_epoch.py:93: Failed
 =============================== warnings summary ===============================
 tests/ut/py/test_worker/test_sub_tensor_args.py::test_mapped_args_from_blob_delivers_tensors_and_scalars
   /home/l00896871/pypto-work/simpler/tests/ut/py/test_worker/test_sub_tensor_args.py:134: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_new.cpp:1556.)
@@ -211,6 +146,5 @@ SKIPPED [1] tests/ut/py/test_worker/test_platform_comm.py:168: --platform requir
 SKIPPED [1] tests/ut/py/test_worker/test_provider_region_onboard.py:88: --platform required
 SKIPPED [16] tests/ut/py/test_worker_caller_stream.py:165: --platform required
 SKIPPED [8] tests/ut/py/test_worker_swimlane_level.py:98: --platform required
-FAILED tests/ut/py/test_global_comm_domain.py::test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import
-FAILED tests/ut/py/test_worker/test_comm_region.py::test_shape_validation_rejects_unsupported_plan_and_non_vmm_backing
-2 failed, 3504 passed, 171 skipped, 1 warning in 165.04s (0:02:45)
+FAILED tests/ut/py/test_mpi_session_epoch.py::test_registry_view_rejects_old_session_with_current_directory_version
+1 failed, 3505 passed, 171 skipped, 1 warning in 156.03s (0:02:36)
