@@ -245,7 +245,7 @@ class MpiDirectControllerContext:
         self._hub = _MpiDirectTransportHub(topology.max_pending_frame_bytes)
         for spec in topology.executors:
             self._hub.register_route(spec.worker_id, spec.rank, self.session_id, spec.comm_profile)
-        self._progress = _ControllerProgress(MPI, world, self._hub, topology.session_timeout_s)
+        self._progress = _ControllerProgress(MPI, world, self._hub, topology.effective_health_timeout_s)
         self._workers: list[Any] = []
         self._closed = False
         self._cleanup_reporter = reporter

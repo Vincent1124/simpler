@@ -142,11 +142,16 @@ def test_topology_rejects_noncontiguous_host_order():
         MpiDirectTopology.from_dict(data)
 
 
-def test_runtime_manifest_round_trip_binds_one_session():
-    topology = MpiDirectTopology.from_dict(_topology_dict())
+@pytest.mark.parametrize("health_timeout", [None, 2.0])
+def test_runtime_manifest_round_trip_binds_one_session(health_timeout):
+    data = _topology_dict()
+    data["health_timeout_s"] = health_timeout
+    topology = MpiDirectTopology.from_dict(data)
     manifest = json.loads(json.dumps(topology.runtime_manifest(91)))
     loaded, session_id = load_runtime_manifest_data(manifest)
     assert loaded == topology
+    assert loaded.health_timeout_s == health_timeout
+    assert loaded.effective_health_timeout_s == (5.0 if health_timeout is None else health_timeout)
     assert session_id == 91
     assert loaded.executor_for_rank(2).worker_id == 1
     assert loaded.executor_for_rank(1).global_device_ranks == (0,)
@@ -741,11 +746,48 @@ def test_controller_preserves_original_error_when_teardown_also_fails(monkeypatc
         runtime_mod._run_controller(None, None, MpiDirectTopology.from_dict(_topology_dict()), 1, "controller")
 
 
-def test_topology_rejects_heartbeat_longer_than_session_timeout():
+@pytest.mark.parametrize("health_timeout", [None, 1.0])
+def test_topology_rejects_heartbeat_at_health_timeout(health_timeout):
     data = _topology_dict()
-    data["heartbeat_interval_s"] = data["session_timeout_s"]
+    data["heartbeat_interval_s"] = data["session_timeout_s"] if health_timeout is None else health_timeout
+    data["health_timeout_s"] = health_timeout
     with pytest.raises(ValueError, match="heartbeat_interval_s must be shorter"):
         MpiDirectTopology.from_dict(data)
+
+
+@pytest.mark.parametrize("health_timeout", [0.0, float("nan"), float("inf")])
+def test_topology_rejects_invalid_health_timeout(health_timeout):
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    with pytest.raises(ValueError, match="health_timeout_s must be a positive finite number"):
+        replace(topology, health_timeout_s=health_timeout).validate()
+    with pytest.raises(ValueError, match="health_timeout_s must be a positive finite number"):
+        MpiDirectTopology.from_dict({**_topology_dict(), "health_timeout_s": health_timeout})
+
+
+@pytest.mark.parametrize("session_timeout, health_timeout, command_timeout", [(5.0, 2.0, 3.0), (0.5, 5.0, 0.5)])
+def test_health_timeout_is_independent_of_native_command_timeout(
+    monkeypatch, session_timeout, health_timeout, command_timeout
+):
+    topology = MpiDirectTopology.from_dict(
+        {**_topology_dict(), "session_timeout_s": session_timeout, "health_timeout_s": health_timeout}
+    )
+    progress = Mock()
+    monkeypatch.setattr(runtime_mod, "_ControllerProgress", progress)
+    mpi, world = Mock(), Mock()
+    context = runtime_mod.MpiDirectControllerContext(mpi, world, topology, 91)
+    worker = Worker(level=4, remote_session_timeout_s=3.0)
+    native = Mock()
+    try:
+        context.attach(worker)
+        worker._worker = native
+        worker._activate_mpi_direct_workers(time.monotonic() + 5)
+        progress.assert_called_once_with(mpi, world, context._hub, health_timeout)
+        assert native.add_remote_l3_mpi.call_count == len(topology.executors)
+        assert all(call.args[-1] == command_timeout for call in native.add_remote_l3_mpi.call_args_list)
+    finally:
+        worker._worker = None
+        worker.close()
+        context._hub.close()
 
 
 def test_fork_fd_snapshot_does_not_close_a_reused_descriptor(tmp_path):
@@ -771,9 +813,12 @@ def test_fork_fd_snapshot_does_not_close_a_reused_descriptor(tmp_path):
 
 def mpi_direct_cpu_orch(_orch, args, _config):
     assert args.scalar(0) == 42
+    delay = args.scalar(1)
+    if delay:
+        threading.Event().wait(delay)
 
 
-def mpi_direct_cpu_controller(context):
+def mpi_direct_cpu_controller(context, *, task_delay=0):
     import ctypes  # noqa: PLC0415
 
     from simpler.task_interface import TaskArgs  # noqa: PLC0415
@@ -800,6 +845,7 @@ def mpi_direct_cpu_controller(context):
         for spec in context.topology.executors:
             args = TaskArgs()
             args.add_scalar(42)
+            args.add_scalar(task_delay)
             orch.submit_next_level(handle, args, config, worker=spec.worker_id)
 
     worker.run(parent)
@@ -901,7 +947,7 @@ def _check_rank_cleanup_output(output, mode, topology):
         report["rank"]: MpiDirectCleanupReport(**{key: value for key, value in report.items() if key != "schema"})
         for report in reports
     }
-    if mode in ("roundtrip", "slurm-allocation"):
+    if mode in ("roundtrip", "slurm-allocation", "slow-command"):
         _check_cleanup_reports(MpiDirectTopology.from_dict(topology), decoded)
     elif mode == "missing-executor-report":
         assert decoded[2].sequence == 0, output
@@ -914,7 +960,7 @@ def _check_rank_cleanup_output(output, mode, topology):
         assert decoded[2].command == "not_observed", output
         assert decoded[2].cleanup == "succeeded", output
         assert not decoded[2].failures, output
-    if mode in ("roundtrip", "slurm-allocation", "executor-close-error", "controller-close-error"):
+    if mode in ("roundtrip", "slurm-allocation", "slow-command", "executor-close-error", "controller-close-error"):
         assert all(report["sequence"] == 2 for report in reports), output
         failed_rank = 2 if mode == "executor-close-error" else 0 if mode == "controller-close-error" else None
         for report in reports:
@@ -1000,6 +1046,7 @@ def _inject_rank_cleanup_fault(tmp_path, mode, supervisor_ready, env):
     "mode",
     [
         "roundtrip",
+        "slow-command",
         "rank0-crash",
         "unused-executors",
         "slurm-allocation",
@@ -1022,8 +1069,12 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
     topology["controller_host"] = "127.0.0.1"
     for spec in topology["executor_ranks"]:
         spec.update(host="127.0.0.1", device_ids=[], num_sub_workers=1)
-    if mode == "idle-executor-stop":
-        topology.update(session_timeout_s=1.5, heartbeat_interval_s=0.1)
+    if mode in ("idle-executor-stop", "slow-command"):
+        topology.update(
+            session_timeout_s=15.0,
+            health_timeout_s=1.5 if mode == "idle-executor-stop" else 2.0,
+            heartbeat_interval_s=0.1,
+        )
     topology_path = tmp_path / "topology.json"
     topology_path.write_text(json.dumps(topology), encoding="utf-8")
     controller_path = tmp_path / "controller.py"
@@ -1033,7 +1084,11 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
         "import os, signal\n"
         "from test_mpi_direct import mpi_direct_cpu_controller\n"
         "def main(context):\n"
-        + ("    pass\n" if mode == "unused-executors" else "    mpi_direct_cpu_controller(context)\n")
+        + (
+            "    pass\n"
+            if mode == "unused-executors"
+            else f"    mpi_direct_cpu_controller(context, task_delay={4 if mode == 'slow-command' else 0})\n"
+        )
         + (
             f"    open({str(crash_marker)!r}, 'w').close()\n    os.kill(os.getpid(), signal.SIGKILL)\n"
             if mode == "rank0-crash"
@@ -1079,7 +1134,7 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
         )
         if mode == "idle-executor-stop":
             assert "timed out waiting for HEALTH frame" in output, output
-        successful = mode in ("roundtrip", "slurm-allocation", "missing-executor-report")
+        successful = mode in ("roundtrip", "slurm-allocation", "slow-command", "missing-executor-report")
         assert (proc.returncode == 0) if successful else (proc.returncode != 0), output
         if mode.startswith("supervisor-"):
             assert proc.returncode == 128 + (signal.SIGTERM if mode == "supervisor-term" else signal.SIGHUP), output

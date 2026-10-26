@@ -164,6 +164,8 @@ TEST(MpiDirectTransport, ProgressReplyExpiresAtItsDeadline) {
     auto hub = ready_hub();
     MpiDirectTransport transport(hub, WORKER_ID, 1.0, 1e-9);
     transport.submit_progress_frame(make_frame(remote_l3::FrameType::TASK, 1));
+    hub->deliver(MPI_RANK, MpiDirectTag::HEALTH, make_frame(remote_l3::FrameType::HEALTH, 2));
+    EXPECT_NO_THROW(hub->check_health(30.0));
     std::vector<uint8_t> reply;
     EXPECT_THROW(transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply), std::runtime_error);
     EXPECT_TRUE(hub->terminal());

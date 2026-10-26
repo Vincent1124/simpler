@@ -220,6 +220,7 @@ def run(  # noqa: PLR0913 -- mirrors the two-host CLI surface used by the other 
     session_timeout: float = 120.0,
     mpirun_path: str = "mpirun",
     launcher_family: str = "auto",
+    health_timeout: float | None = None,
 ) -> int:
     local_ids = _parse_devices(local_devices, label="local")
     remote_ids = _parse_devices(remote_devices, label="remote")
@@ -244,6 +245,8 @@ def run(  # noqa: PLR0913 -- mirrors the two-host CLI surface used by the other 
             for index, (host, devices) in enumerate(((local_host, local_ids), (remote_host, remote_ids)))
         ],
     }
+    if health_timeout is not None:
+        topology["health_timeout_s"] = float(health_timeout)
     with tempfile.TemporaryDirectory(prefix="simpler-mpi-direct-") as directory:
         topology_path = Path(directory) / "topology.json"
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
@@ -274,6 +277,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--comm-profile", default="a3-fabric-v1")
     parser.add_argument("--startup-timeout", type=float, default=180.0)
     parser.add_argument("--session-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--health-timeout", type=float, default=None, help="Missing-heartbeat timeout; defaults to --session-timeout"
+    )
     parser.add_argument("--mpirun-path", default="mpirun")
     parser.add_argument("--launcher-family", choices=("auto", "openmpi", "mpich"), default="auto")
     return parser.parse_args()

@@ -214,6 +214,14 @@ A standalone resolver checks snapshot availability; live validation belongs to
 the owning Worker. Nested MPI configuration describes endpoints but does not
 establish their availability.
 
+Direct MPI topology accepts an optional positive finite `health_timeout_s`.
+When absent or `null`, it uses `session_timeout_s`. The periodic
+`heartbeat_interval_s` must be shorter than the effective health timeout. The
+controller checks each initialized, uncancelled route's health independently of
+pending commands, including idle periods. Command deadlines keep their own
+timeout; receiving heartbeats does not extend them. Changing the health timeout
+does not change startup or close wait budgets.
+
 Native hub failure, route cancellation and closure publish transport state and
 wake waiting requests independently of Python epoch observation. Region checks
 do not add a transport notification path or a heartbeat loop. Task and control

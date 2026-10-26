@@ -88,11 +88,24 @@ MPI calls use `MPI_THREAD_SERIALIZED`. Controller progress and executor
 receive loops poll without sleeping on the task path; an idle rank can
 therefore occupy a CPU core. Startup retries and periodic heartbeats may
 block because they do not delay task dispatch. The controller detects a
-missing heartbeat after `session_timeout_s`, including while no task is active;
-`heartbeat_interval_s` must be shorter than that timeout. A progress failure
+missing heartbeat after `health_timeout_s`, including while no task is active.
+Omitting this optional topology field or setting it to `null` uses
+`session_timeout_s` as the health timeout. `heartbeat_interval_s` must be shorter
+than the effective health timeout. The example's `--health-timeout` option sets
+this field independently of `--session-timeout`; for example, use
+`--session-timeout 120 --health-timeout 10` for commands that may take longer
+than the missing-heartbeat detection window. Healthy long-running commands
+continue while heartbeats arrive, but heartbeats do not extend command deadlines.
+The Worker's `remote_session_timeout_s` can further limit the command timeout.
+Changing the health timeout does not change the existing close wait budget.
+A progress failure
 calls `MPI_Abort` from the progress thread even when the controller callback is
 waiting for an external event. If progress cannot drain, rank 0 exits without
 making another concurrent MPI call and the launcher reaps the world.
+
+A missing heartbeat indicates suspected loss of progress, not proof that an
+executor has exited or released its device and communication resources. Resource
+reuse requires independent cleanup confirmation.
 
 Normal close stops task admission, sends lifecycle `SHUTDOWN` to each idle
 executor, then drains MPI sends. Native `Worker.close()` releases the Python
