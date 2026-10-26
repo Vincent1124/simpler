@@ -104,6 +104,29 @@ TEST(MpiDirectTransportHub, DetectsMissingHeartbeatDuringIdleSession) {
     EXPECT_NE(hub->terminal_error().find("HEALTH"), std::string::npos);
 }
 
+TEST(MpiDirectTransportHub, SessionSnapshotDistinguishesRouteFailureAndClosure) {
+    auto hub = ready_hub();
+    auto initial = hub->session_snapshot();
+    EXPECT_FALSE(initial.closed);
+    EXPECT_TRUE(initial.terminal_error.empty());
+    EXPECT_TRUE(initial.unavailable_workers.empty());
+
+    MpiDirectTransport transport(hub, WORKER_ID, 1.0, 1.0);
+    transport.shutdown();
+    auto cancelled = hub->session_snapshot();
+    EXPECT_FALSE(cancelled.closed);
+    EXPECT_TRUE(cancelled.terminal_error.empty());
+    EXPECT_EQ(cancelled.unavailable_workers, std::vector<int32_t>{WORKER_ID});
+
+    hub->fail("progress failed");
+    hub->fail("duplicate failure");
+    hub->close();
+    auto terminal = hub->session_snapshot();
+    EXPECT_TRUE(terminal.closed);
+    EXPECT_EQ(terminal.terminal_error, "progress failed");
+    EXPECT_EQ(terminal.unavailable_workers, cancelled.unavailable_workers);
+}
+
 TEST(MpiDirectTransportHub, HeartbeatStartsAtHelloAndIgnoresCancelledRoutes) {
     auto hub = std::make_shared<MpiDirectTransportHub>(MAX_FRAME_BYTES);
     hub->register_route(WORKER_ID, MPI_RANK, SESSION_ID, "sim");

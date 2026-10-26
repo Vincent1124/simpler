@@ -151,9 +151,10 @@ from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
 configuration. All participating nodes must use the same profile.
 
 An MPI-launched group registered with `add_mpirun_worker_group` uses the same
-member contract. Rank 0 writes the group manifest before launch, every MPI rank
-must publish READY before the L4 parent exposes the returned worker ids, and
-the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+member contract. Registration returns configuration ids and publishes the group
+atomically; it does not establish readiness. The parent writes the manifest
+before launch, and every MPI rank must publish READY before native attach.
+The `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
 must include the complete returned group; their order still defines dense
 domain ranks. A full MPI group exchanges descriptors rank-side over an MPI
 collective, so the L4 import fanout is skipped; a partial group falls back to
@@ -181,6 +182,54 @@ The control flow is:
 `PREPARE_EXPORT`, `IMPORT`, `COMMIT`, and `ABORT`. Runtime data movement does
 not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
 `GlobalDomainCopyCommand`, and teardown uses `GlobalDomainReleaseCommand`.
+
+### MPI session identity and availability
+
+A Direct MPI controller associates one job-wide `session_id` with its static
+rank/worker topology and an owner-local `session_epoch`, initially one. The
+nonzero session identity occupies the full uint64 range and is shared by all
+executor ranks. All executor endpoints must attach successfully before that
+generation becomes available. Startup rollback and Worker close retire the
+session before native teardown.
+
+The endpoint registry stores an immutable `MpiSessionView` for each executor's
+host and device endpoints. It identifies the owner path, job session, epoch,
+rank and worker, together with snapshot availability. Records must match the
+registry's owner nonce and directory version. `session_epoch` versions the MPI
+session view; `registry_epoch` versions the owner's endpoint directory. A
+directory change alone does not advance the session epoch.
+
+Registry lookup, planning and region materialization observe a coherent native
+hub snapshot containing closure, failure and unavailable routes. A newly
+observed change advances the session epoch and invalidates the cached registry.
+Repeated observations do not advance it again. An observation captured for a
+different session object or epoch cannot overwrite the current state. Hub
+failure or closure makes the session unavailable; a cancelled route is refused
+when selected. Native errors can still terminate the entire MPI world.
+
+Planning and materialization recheck selected session identities and directory
+versions at their validation boundaries. Old snapshots must be refreshed after
+a change; an old session epoch is refused even if the directory version matches.
+A standalone resolver checks snapshot availability; live validation belongs to
+the owning Worker. Nested MPI configuration describes endpoints but does not
+establish their availability.
+
+Native hub failure, route cancellation and closure publish transport state and
+wake waiting requests independently of Python epoch observation. Region checks
+do not add a transport notification path or a heartbeat loop. Task and control
+admission retain their lifecycle and backend checks.
+
+After a valid delegated `ALLOCATED` reply, region materialization binds the
+release identity before rechecking session availability. A registry or session
+refusal aborts materialization through that release edge; refusal alone does
+not latch a fatal delegated-session error. Invalid allocation replies are
+fatal; incomplete release records an unreclaimable-resource error and prevents
+further work.
+
+Session invalidation does not establish that processes, device contexts or
+remote resources have been released. The epoch is an owner-local validation
+boundary; transport and domain commands carry their own identities. It does
+not implement same-session reconnection or cross-generation wire validation.
 
 ### Attachment axis
 

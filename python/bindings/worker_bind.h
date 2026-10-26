@@ -328,6 +328,13 @@ inline void bind_worker(nb::module_ &m) {
             nb::call_guard<nb::gil_scoped_release>()
         )
         .def("close", &MpiDirectTransportHub::close)
+        .def(
+            "session_snapshot",
+            [](const MpiDirectTransportHub &self) {
+                auto snapshot = self.session_snapshot();
+                return nb::make_tuple(snapshot.closed, snapshot.terminal_error, snapshot.unavailable_workers);
+            }
+        )
         .def_prop_ro("pending_frame_bytes", &MpiDirectTransportHub::pending_frame_bytes)
         .def_prop_ro("terminal", &MpiDirectTransportHub::terminal)
         .def_prop_ro("all_routes_shutdown", &MpiDirectTransportHub::all_routes_shutdown)

@@ -81,7 +81,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -163,9 +163,14 @@ from .comm_endpoints import (
     BackendResolver,
     DefaultRegionAccessService,
     EndpointDeployment,
+    EndpointRecord,
     EndpointRegistry,
+    EndpointResolveError,
+    EndpointResolveReason,
+    MpiSessionView,
     RegionAccessService,
     RegionLayoutSpec,
+    ResolvedRegionSpec,
     SingleOwner,
     UnsupportedRegionPlan,
     _EndpointTopologyEntry,
@@ -1219,6 +1224,18 @@ class _MpiL3GroupRuntime:
     mailbox: Any | None = None
     monitor_thread: threading.Thread | None = None
     closing: bool = False
+
+
+@dataclass
+class _MpiDirectSessionRuntime:
+    topology: MpiDirectTopology
+    session_id: int
+    hub: _MpiDirectTransportHub
+    session_epoch: int = 1
+    active: bool = False
+    retired: bool = False
+    failure: str = ""
+    unavailable_workers: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -5767,7 +5784,7 @@ class Worker:
         self._mpi_l3_groups: list[_MpiL3GroupRuntime] = []
         self._mpi_worker_ids: list[int] = []
         self._mpi_rank_by_worker_id: dict[int, _MpiL3RankRuntime] = {}
-        self._mpi_direct_session: tuple[MpiDirectTopology, int, _MpiDirectTransportHub] | None = None
+        self._mpi_direct_session: _MpiDirectSessionRuntime | None = None
         self._mpi_direct_worker_ids: list[int] = []
         self._next_level_worker_id_count: int = 0
         # Fallback ownership for private helpers used outside Worker.submit.
@@ -5964,7 +5981,7 @@ class Worker:
 
     @property
     def _mpi_direct_worker_specs(self) -> tuple[MpiDirectExecutorSpec, ...]:
-        return self._mpi_direct_session[0].executors if self._mpi_direct_session is not None else ()
+        return self._mpi_direct_session.topology.executors if self._mpi_direct_session is not None else ()
 
     def _configure_mpi_direct(
         self, topology: MpiDirectTopology, session_id: int, hub: _MpiDirectTransportHub
@@ -5983,8 +6000,11 @@ class Worker:
                 or tuple(spec.worker_id for spec in topology.executors) != expected_ids
             ):
                 raise ValueError("MPI direct worker ids must match dense NEXT_LEVEL allocation order")
+            for spec in topology.executors:
+                MpiSessionView(self._delegated_control_path, session_id, 1, spec.rank, spec.worker_id, False)
             self._mpi_direct_worker_ids = [self._allocate_next_level_worker_id() for _ in topology.executors]
-            self._mpi_direct_session = (topology, session_id, hub)
+            self._mpi_direct_session = _MpiDirectSessionRuntime(topology, session_id, hub)
+            self._invalidate_endpoint_registry()
             return tuple(self._mpi_direct_worker_ids)
 
     def _check_mpi_controller_children(self) -> None:
@@ -6612,19 +6632,32 @@ class Worker:
     def _activate_mpi_direct_workers(self, deadline: float) -> None:
         if self._mpi_direct_session is None:
             return
-        topology, session_id, hub = self._mpi_direct_session
+        session = self._mpi_direct_session
+        topology, session_id, hub = session.topology, session.session_id, session.hub
         assert self._worker is not None
         session_timeout = min(self._remote_session_timeout_s(), topology.session_timeout_s)
-        for spec in topology.executors:
-            remaining = self._remaining_until(deadline, "direct MPI L3 endpoint attach")
-            self._worker.add_remote_l3_mpi(
-                spec.worker_id,
-                session_id,
-                spec.comm_profile,
-                hub,
-                remaining,
-                session_timeout,
-            )
+        try:
+            for spec in topology.executors:
+                remaining = self._remaining_until(deadline, "direct MPI L3 endpoint attach")
+                self._worker.add_remote_l3_mpi(
+                    spec.worker_id,
+                    session_id,
+                    spec.comm_profile,
+                    hub,
+                    remaining,
+                    session_timeout,
+                )
+            self._remaining_until(deadline, "direct MPI L3 activation")
+            self._observe_mpi_sessions()
+            with self._hierarchical_start_cv:
+                if session.retired or session.failure or session.unavailable_workers or self._cancel_token:
+                    raise InitCancelled("Direct MPI session became unavailable during startup")
+                session.active = True
+                self._invalidate_endpoint_registry()
+        except BaseException:
+            with self._hierarchical_start_cv:
+                self._retire_mpi_direct_session_locked()
+            raise
 
     def _publish_initial_mpi_direct_callables(self) -> None:  # noqa: PLR0912 -- registration transaction spans three callable namespaces
         if not self._mpi_direct_worker_specs:
@@ -7726,10 +7759,26 @@ class Worker:
             entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
             self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
         for spec in worker._mpi_direct_worker_specs:
+            session = worker._mpi_direct_session
+            assert session is not None
+            view = MpiSessionView(
+                path,
+                session.session_id,
+                session.session_epoch,
+                spec.rank,
+                spec.worker_id,
+                worker is self
+                and session.active
+                and not session.retired
+                and not session.failure
+                and spec.worker_id not in session.unavailable_workers,
+            )
             mpi_node_identity = _normalize_node_identity(spec.host)
             mpi_path = _format_worker_path(3, parent_path=path, index=int(spec.worker_id))
-            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
-            self._append_device_endpoint_topology(entries, mpi_path, spec.device_ids, mpi_node_identity)
+            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity, mpi_session=view))
+            self._append_device_endpoint_topology(
+                entries, mpi_path, spec.device_ids, mpi_node_identity, mpi_session=view
+            )
 
     def _append_device_endpoint_topology(
         self,
@@ -7739,13 +7788,18 @@ class Worker:
         node_identity: str,
         *,
         local_worker: Worker | None = None,
+        mpi_session: MpiSessionView | None = None,
     ) -> None:
         identities = None if local_worker is None else local_worker._ensure_local_device_endpoint_identities()
         for child_index, _device_id in enumerate(tuple(device_ids)):
             device_path = _format_worker_path(2, parent_path=path_to_l3, index=child_index)
             if identities is None:
-                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity))
-                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity))
+                entries.append(
+                    _EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity, mpi_session=mpi_session)
+                )
+                entries.append(
+                    _EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity, mpi_session=mpi_session)
+                )
                 continue
             aicore_nonce, aicore_allocator = identities[(child_index, DEVICE_AICORE)]
             aicpu_nonce, aicpu_allocator = identities[(child_index, DEVICE_AICPU)]
@@ -7782,15 +7836,91 @@ class Worker:
         deployment_order = {HOST_CPU: 0, DEVICE_AICORE: 1, DEVICE_AICPU: 2}
         return (parse_endpoint_path(entry.path, root_level=root_level).sort_key, deployment_order[entry.deployment])
 
+    def _observe_mpi_sessions(self) -> None:
+        with self._hierarchical_start_cv:
+            session = self._mpi_direct_session
+            if session is None or session.retired:
+                return
+            epoch = session.session_epoch
+        closed, failure, unavailable = session.hub.session_snapshot()
+        with self._hierarchical_start_cv:
+            if self._mpi_direct_session is not session or session.session_epoch != epoch or session.retired:
+                return
+            unavailable = session.unavailable_workers | frozenset(unavailable)
+            failure = session.failure or failure
+            if (closed, failure, unavailable) == (False, session.failure, session.unavailable_workers):
+                return
+            session.retired = bool(closed)
+            session.failure = str(failure)
+            session.unavailable_workers = unavailable
+            if closed or failure:
+                session.active = False
+            session.session_epoch += 1
+            self._invalidate_endpoint_registry()
+            self._hierarchical_start_cv.notify_all()
+
+    def _retire_mpi_direct_session_locked(self) -> None:
+        """The caller holds the lifecycle condition lock."""
+        session = self._mpi_direct_session
+        if session is not None and not session.retired:
+            session.retired = True
+            session.active = False
+            if not session.failure:
+                session.session_epoch += 1
+            self._invalidate_endpoint_registry()
+
     def _get_endpoint_registry(self) -> EndpointRegistry:
         self._require_ready_for_region_planning("_get_endpoint_registry")
-        registry = self._endpoint_registry
-        if registry is None:
-            registry = EndpointRegistry.from_snapshot(
-                self._endpoint_topology_snapshot(), registry_epoch=self._endpoint_registry_epoch
-            )
-            self._endpoint_registry = registry
-        return registry
+        self._observe_mpi_sessions()
+        with self._hierarchical_start_cv:
+            if self._endpoint_registry is None:
+                self._endpoint_registry = EndpointRegistry.from_snapshot(
+                    self._endpoint_topology_snapshot(), registry_epoch=self._endpoint_registry_epoch
+                )
+            return self._endpoint_registry
+
+    def _validate_endpoint_registry(self, registry: EndpointRegistry, members: Sequence[EndpointRecord]) -> None:
+        self._observe_mpi_sessions()
+        with self._hierarchical_start_cv:
+            if (registry.session_instance_id, registry.registry_epoch) != (
+                self._owner_instance_id,
+                self._endpoint_registry_epoch,
+            ):
+                raise EndpointResolveError(EndpointResolveReason.REGISTRY_MISMATCH, "stale endpoint registry")
+            registry.require_mpi_sessions_available(members)
+            session = self._mpi_direct_session
+            root_path = _format_worker_path(int(self.level))
+            specs = {spec.worker_id: spec for spec in self._mpi_direct_worker_specs}
+            rank_paths = {f"{root_path}/L3[{worker_id}]" for worker_id in specs}
+            for member in members:
+                view = registry.mpi_session_for_endpoint(member)
+                rank_path = "/".join(member.path.split("/", 2)[:2])
+                if view is None:
+                    if rank_path in rank_paths:
+                        raise EndpointResolveError(EndpointResolveReason.MPI_SESSION_UNAVAILABLE, "missing MPI view")
+                    continue
+                spec = specs.get(view.worker_id)
+                if (
+                    session is None
+                    or spec is None
+                    or not session.active
+                    or session.retired
+                    or session.failure
+                    or spec.worker_id in session.unavailable_workers
+                    or view
+                    != MpiSessionView(
+                        root_path, session.session_id, session.session_epoch, spec.rank, spec.worker_id, True
+                    )
+                ):
+                    raise EndpointResolveError(EndpointResolveReason.MPI_SESSION_UNAVAILABLE, "stale MPI session view")
+
+    def _plan_current_region(
+        self, registry: EndpointRegistry, resolved: ResolvedRegionSpec, layout: RegionLayoutSpec
+    ) -> BackendPlan | UnsupportedRegionPlan:
+        self._validate_endpoint_registry(registry, resolved.members)
+        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+        self._validate_endpoint_registry(registry, resolved.members)
+        return plan
 
     def _get_region_access_service(self) -> RegionAccessService:
         service = self._region_access_service
@@ -7811,8 +7941,7 @@ class Worker:
         with self._operation_lease("_plan_region"):
             registry = self._get_endpoint_registry()
             resolved = registry.resolve_region_spec(members, topology)
-            resolver = BackendResolver(registry, self._get_region_access_service())
-            return resolver.plan(resolved, layout_summary)
+            return self._plan_current_region(registry, resolved, layout_summary)
 
     def _materialize_region_instance(
         self, members, topology: SingleOwner, layout_summary: RegionLayoutSpec
@@ -7824,8 +7953,7 @@ class Worker:
         ):
             registry = self._get_endpoint_registry()
             resolved = registry.resolve_region_spec(members, topology)
-            resolver = BackendResolver(registry, self._get_region_access_service())
-            plan = resolver.plan(resolved, layout_summary)
+            plan = self._plan_current_region(registry, resolved, layout_summary)
             return materialize_region_instance(
                 MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout_summary)
             )
@@ -7842,7 +7970,7 @@ class Worker:
         topology = SingleOwner(provider=provider)
         registry = self._get_endpoint_registry()
         resolved = registry.resolve_region_spec(members, topology)
-        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+        plan = self._plan_current_region(registry, resolved, layout)
         ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
         validate_single_owner_region_shape(ctx)
         return ctx
@@ -8980,7 +9108,13 @@ class Worker:
             # Atomic READY commit inside the exception boundary: publish the
             # single lifecycle state so no thread ever observes a started
             # hierarchy while the worker is not yet READY.
+            self._observe_mpi_sessions()
             with self._hierarchical_start_cv:
+                session = self._mpi_direct_session
+                if session is not None and (
+                    not session.active or session.retired or session.failure or session.unavailable_workers
+                ):
+                    raise InitCancelled("Direct MPI session is unavailable before READY")
                 # Final root-deadline gate, in the same critical section as the
                 # commit: a thread descheduled between startup and here cannot
                 # publish READY past the single root startup deadline. Applied to
@@ -9839,6 +9973,8 @@ class Worker:
         (including ``_abort_hierarchical``) so the whole rollback is bounded
         end-to-end rather than each phase re-acquiring a full timeout.
         """
+        with self._hierarchical_start_cv:
+            self._retire_mpi_direct_session_locked()
         deadline = _monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
 
         with contextlib.suppress(BaseException):
@@ -14016,6 +14152,7 @@ class Worker:
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
+                self._retire_mpi_direct_session_locked()
                 self._lifecycle = _Lifecycle.CLOSED
                 self._invalidate_endpoint_registry()
                 attempt = _CloseAttempt()
