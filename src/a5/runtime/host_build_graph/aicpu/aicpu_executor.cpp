@@ -175,8 +175,8 @@ static void log_unfinished_tasks(Runtime *runtime) {
         }
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
-            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32
-            " producer_state=%" PRId64 " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
+            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32 " producer_state=%" PRId64
+            " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
             task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
             controls[task].next_fanin_index, controls[task].waiting_producer,
             controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
@@ -198,22 +198,19 @@ static void log_unfinished_tasks(Runtime *runtime) {
         const int32_t head = static_cast<int32_t>(static_cast<uint32_t>(packed));
         const int32_t tail = static_cast<int32_t>(static_cast<uint32_t>(packed >> 32));
         if (head < 0 && tail < 0) continue;
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail
-        );
+        LOG_ERROR("A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail);
     }
     // The directory is what a thief consults before looking at an inbox, so a
     // bit set over an empty inbox wastes scans and a bit clear over a full one
     // hides the work. Either way it belongs next to the endpoints above.
-    auto *directory = scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
+    auto *directory =
+        scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
     cache_invalidate_range(directory, sizeof(*directory));
     for (uint32_t type = 0; type < 3; ++type) {
         for (uint32_t shard = 0; shard < SCHEDULER_READY_DIRECTORY_SHARD_COUNT; ++shard) {
             const uint64_t bits = directory->core_types[type][shard].bits;
             if (bits == 0) continue;
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits
-            );
+            LOG_ERROR("A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits);
         }
     }
     // The AICores are still running when this timeout fires, so one pass cannot
@@ -247,13 +244,8 @@ static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_s
     if (context != nullptr) {
         cache_invalidate_range(context, 128);
         SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-        if (run_control != nullptr &&
-            record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site)) {
-            cache_flush_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
-            );
-            wmb();
-        }
+        if (run_control != nullptr)
+            (void)record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site);
     }
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
         auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
@@ -271,7 +263,7 @@ static int32_t read_runtime_status(Runtime *runtime) {
     return runtime_status_from_error_code(sched_error_code);
 }
 
-static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
+static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const char *phase = nullptr) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
@@ -281,10 +273,12 @@ static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
         run_control = aicore_scheduler_run_control(context);
         if (run_control != nullptr) {
             cache_invalidate_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
             );
         }
     }
+    if (phase != nullptr) log_aicore_scheduler_error_identity(run_control, phase);
     return settle_aicore_runtime_status(run_control, &header->sched_error_code);
 }
 
@@ -305,17 +299,19 @@ static void publish_aicore_task_timing(Runtime *runtime) {
         const int32_t slot = metadata[task_id].timing_slot;
         if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) continue;
         if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
-        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-            if ((metadata[task_id].active_mask & (1U << subtask)) == 0) continue;
-            auto &trace = traces[scheduler_task_trace_index(
-                metadata[task_id].trace_index_base, metadata[task_id].active_mask, subtask
-            )];
-            cache_invalidate_range(&trace, sizeof(trace));
-            const uint64_t start = trace.kernel_start_cycles;
-            const uint64_t end = trace.kernel_end_cycles;
-            if (start == 0 || end <= start) continue;
-            if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
-            if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+        for (uint32_t block = 0; block < metadata[task_id].logical_block_num; ++block) {
+            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+                if ((metadata[task_id].active_mask & (1U << subtask)) == 0) continue;
+                auto &trace = traces[scheduler_task_trace_index(
+                    metadata[task_id].trace_index_base, metadata[task_id].active_mask, subtask, block
+                )];
+                cache_invalidate_range(&trace, sizeof(trace));
+                const uint64_t start = trace.kernel_start_cycles;
+                const uint64_t end = trace.kernel_end_cycles;
+                if (start == 0 || end <= start) continue;
+                if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
+                if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+            }
         }
     }
     aicpu_publish_task_timing_tail_usage(1);
@@ -571,7 +567,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         error_poll_count = 0;
                         ++error_poll_total;
                         cache_invalidate_range(
-                            reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                            reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                            sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
                         );
                         if (run_control->scheduler_error != 0) break;
                     }
@@ -582,7 +579,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     SPIN_WAIT_HINT();
                 }
                 cache_invalidate_range(
-                    reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, executed_task_count), 256
+                    reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, executed_task_count),
+                    sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, executed_task_count)
                 );
                 if (run_control->scheduler_error != 0) {
                     LOG_ERROR(
@@ -597,7 +595,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         run_control->executed_task_count, run_control->resolved_task_count,
                         run_control->expected_task_count, run_control->inline_completed_count
                     );
-                    supervisor_rc = publish_aicore_scheduler_runtime_error(runtime);
+                    supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
                     if (supervisor_rc == 0) supervisor_rc = -1;
                 }
                 if (supervisor_rc == 0 && run_control->resolved_task_count + run_control->inline_completed_count !=
@@ -681,7 +679,7 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // zero, and the error carried by nothing. This is the boundary where every
     // participant has finished its shutdown partition, so one settle covers
     // every core.
-    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime);
+    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime, "terminal");
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }
