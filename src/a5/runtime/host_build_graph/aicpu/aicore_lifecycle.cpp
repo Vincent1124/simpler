@@ -49,11 +49,8 @@ void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
     if (context == nullptr) return;
     cache_invalidate_range(context, 128);
     SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-    if (run_control == nullptr ||
-        !record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site))
-        return;
-    cache_flush_range(reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128);
-    wmb();
+    if (run_control == nullptr) return;
+    (void)record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site);
 }
 
 }  // namespace
@@ -207,6 +204,18 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         LOG_ERROR("A5 HBG AICore scheduler: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
         return -1;
     }
+    auto *graph_summary =
+        scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
+    cache_invalidate_range(graph_summary, sizeof(*graph_summary));
+    if (graph_summary->worker_count != static_cast<uint64_t>(core_count_) ||
+        graph_summary->cluster_count != static_cast<uint64_t>(aic_count)) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: planned topology differs from discovery (workers=%" PRIu64 " clusters=%" PRIu64
+            ", discovered workers=%d AIC=%d AIV=%d)",
+            graph_summary->worker_count, graph_summary->cluster_count, core_count_, aic_count, aiv_count
+        );
+        return -1;
+    }
     int32_t cluster_workers[SCHEDULER_CLUSTER_CAPACITY][PLATFORM_CORES_PER_BLOCKDIM];
     for (auto &cluster : cluster_workers)
         for (int32_t &worker : cluster)
@@ -340,20 +349,34 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             cache_invalidate_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
             );
             if (run_control->scheduler_error != 0) {
+                log_aicore_scheduler_error_identity(run_control, "bootstrap");
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
-                    " type=%" PRIu64 " site=%" PRIu64,
+                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64
+                    " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                    " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
-                    run_control->error_core_type, run_control->error_site
+                    run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
+                    run_control->scheduler_count, run_control->bootstrap_scan_arrived_count,
+                    run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
+                    run_control->bootstrap_complete
                 );
                 return -1;
             }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
-            LOG_ERROR("%s", "A5 HBG AICore Scheduler bootstrap timeout");
+            LOG_ERROR(
+                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " schedulers=%" PRIu64
+                " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                " bootstrap_complete=%" PRIu64,
+                run_control->active_worker_count, run_control->scheduler_count,
+                run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
+                run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+            );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;
         }
