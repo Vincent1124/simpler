@@ -1,29 +1,54 @@
-# A5 resident 基线与诊断：复制命令及回显回填
+# 第一批：resident现状基线与协议诊断（按依赖关系分批）
 
-本页保留可直接复制到A5 Linux Bash的现有命令；先阅读[测量目标与实验设计](README.md)。命令针对mdtest中基于2a298d1eb的resident，不会自动实现新埋点或运行尚未编写的并发微基准。
+本页是[测量计划](README.md)的第一批执行单。**批次按前置依赖划分，不按用例数量划分**：环境/构建通过后，现有L0基线、fanout诊断、admission/Mix/Graph诊断不依赖彼此的测量结论，全部在本批执行。需要新埋点或据实测设计的并发微基准，才放入后续批次。
 
-执行顺序：第1节环境确认 → 第2节L0基线 → 按需第2.1节fanout/L3和第2.2节Mix/L4诊断 → 按主README的实验编号回填。命令在同一终端、simpler根目录依次执行。阶段1只能建立现状，不能据此声称测出了CAS、锁等待或安全并发的因果收益。
+源码基准：mdtest合入的upstream `2a298d1eb`，默认TICKET/H8，包含PR #2857。以下在 **A5 Linux Bash、simpler仓库根目录、同一终端** 依次复制执行；本地尚未运行真机测试。只生成测试包装脚本，不修改runtime算法、编译开关或任务协议。
 
-## 1. 同步、构建与环境回显
+## 1. 第一批的目标、测试目的与产物
 
-在真机 simpler 根目录执行。快进更新不会覆盖已有结果/源码，遇到冲突回传现场，不要 reset/clean。尚未有仓库时，先克隆个人 fork 并进入仓库。
+目标是建立可复现的resident参照，确认实际调度模式、数值和执行链路，找出值得进一步分解的场景。**本批没有新增计时埋点，不能直接给出CAS/锁占比，也不能证明某并发方案更快或无死锁。**
+
+| 用例ID | L0测量目的 | 同批协议诊断 |
+| ------ | ---------- | ------------ |
+| chain-aic / chain-aiv | 短链控制间隔参照，可能大量走直接候选 | 无单独高等级采集 |
+| fanout256 / fanout1024 | 集中释放Ready工作的分布、规模和wall表现；不是多生产者微基准 | 只采256的L3，避免1024高等级扰动 |
+| spmd-aic8 / spmd-aiv16 | 纯AIC/AIV多block的admission、block领取与完成路径参照 | 各采一轮L4 |
+| mix3 / mix5 / mix6 / mix7 | 独立Mix burst的执行参照，覆盖不同资源集合 | 各采一轮L4 |
+| ordinary-mix | 普通工作和Mix交错的参照 | 一轮L4 |
+| graph-replay | Definition记录/replay及控制节点路径的参照 | 一轮L4 |
+
+L0共12个case，每case三个独立进程，每进程55轮，丢弃前5轮、统计50轮。诊断共9个进程、每case一轮，和L0分开。**所有进程同卡串行运行，单次设备分配覆盖全批**；不能并跑测试进程来冒充核内并发实验。无需每个case后等待分析，全批成功后统一回传。
+
+```text
+代码/工具链/设备环境 → 构建与架构确认
+                            ├─ L0各case × 三批：取得整体性能参照
+                            ├─ fanout L3：观察工作分布与调度阶段
+                            └─ admission/Mix/Graph L4：取得协议诊断证据
+以上实验不互相依赖测量结论；脚本串行是为保持设备独占和数据可比性。
+```
+
+Mix资源预期：mask3→AIC+AIV0，mask5→AIC+AIV1，mask6→AIC控制者+两个AIV，mask7→三lane。mask之间计算量不同，wall不能直接相减当同步收益。协议记录按当前普通v8/native Graph v9解释；数值通过不代替独立严格协议审计。CSA/SWA冻结数据和专用多生产者基准尚有数据/实现前置条件，本批不伪造其命令或结果。
+
+## 2. 准备代码、构建和环境记录
+
+以下准备是设备测试的共同前置条件，不需要先回传一次才能继续。已有源码改动/结果时先保留；快进失败就回传，不要reset/clean。尚未加载CANN时，先按真机实际位置source对应set_env.sh。
 
 ```bash
 set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
 git fetch origin mdtest
 git switch mdtest
 git merge --ff-only origin/mdtest
 test "$(git branch --show-current)" = mdtest
-git status --short
-git log -1 --format='%H %s'
-# 若尚未加载 CANN，先按本机位置 source 对应 set_env.sh。
-test -n "${ASCEND_HOME_PATH:-}" || { printf '请先加载 CANN set_env.sh\n'; exit 1; }
+git merge-base --is-ancestor 2a298d1ebf427a7b2b2286ea052bca733c0ece85 HEAD
+test -n "${ASCEND_HOME_PATH:-}" || { printf '请先加载CANN set_env.sh\n'; exit 1; }
 test -x .venv/bin/python || python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-export READY_RESULT_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-baseline"
-mkdir -p "$READY_RESULT_DIR/ascend"
-python -m pip install --no-build-isolation -e . 2>&1 | tee "$READY_RESULT_DIR/build.log"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
+export BATCH01_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-batch01"
+mkdir -p "$BATCH01_DIR/ascend" "$BATCH01_DIR/l0" "$BATCH01_DIR/diagnostic"
+bash .claude/skills/onboard-arch-precheck/check.sh a5 2>&1 | tee "$BATCH01_DIR/arch.txt"
+command -v task-submit
+python -m pip install --no-build-isolation -e . 2>&1 | tee "$BATCH01_DIR/build.log"
 {
   git log -1 --format='%H %s'
   git status --short
@@ -31,54 +56,72 @@ bash .claude/skills/onboard-arch-precheck/check.sh a5
   python --version
   printf 'CANN=%s\n' "$ASCEND_HOME_PATH"
   command -v ccec
-  command -v task-submit || true
   npu-smi info || task-submit --run 'npu-smi info'
   test ! -f /usr/local/Ascend/driver/version.info || cat /usr/local/Ascend/driver/version.info
   find "$ASCEND_HOME_PATH" -maxdepth 2 -name version.info -type f -print -exec cat {} \;
   find build/lib/a5 -type f -name '*.so' -exec sha256sum {} \;
   rg -n 'kReadyPoolGroupWidth|kReadyPoolKind' src/a5/runtime/host_build_graph/host/runtime_maker.cpp
-} 2>&1 | tee "$READY_RESULT_DIR/environment.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$READY_RESULT_DIR/source.patch"
-printf '\n[READY_BENCH] RESULT_DIR=%s\n' "$READY_RESULT_DIR"
+} 2>&1 | tee "$BATCH01_DIR/environment.txt"
+git diff HEAD -- src python simpler_setup conftest.py > "$BATCH01_DIR/source.patch"
+printf '\n[BATCH01] RESULT_DIR=%s\n' "$BATCH01_DIR"
 ```
 
-**回传 environment.txt 与失败时的末尾输出**。预期 A5 检查通过、mdtest、TICKET/8 和设备列表。缺少 task-submit 时先停止，说明设备编号和独占情况，再安排不加锁的测试。新增未跟踪源码不在 source.patch 中，需额外保存提交。
+解释：架构预检避免用错芯片；本地venv和重新构建避免加载旧runtime；SHA/PTO-ISA/runtime哈希固定版本证据。source.patch不含未跟踪的新源码，需额外保留。缺少task-submit或架构/构建失败时停止并回传现有日志；不自动换sim、legacy或未隔离设备。
 
-## 2. 基线与诊断命令
+## 3. 生成第一批执行脚本
 
-先整块复制生成脚本。每 case 一个进程内执行55轮，固定丢弃前5轮后统计50轮；每 case 三个独立进程，保留 golden 校验，level=0。短链可能走直接候选；fanout 由一个 root 释放后继，不代表所有多生产者竞争。
+整块复制。case清单中的路径和筛选对应现有测试；`SIMPLER_REPORT_SCHEDULER_MODE=1`是已有诊断选项，记录实际模式，resident marker还会检查回退。L0与诊断分别落盘。某case失败时立即停止，防止后续测试使用异常设备状态；此前结果保留，不自动重试或重置设备。
 
 ```bash
-cat > PerformanceTest/run-ready-baseline.sh <<'BASH'
+cat > "$BATCH01_DIR/run-batch01.sh" <<'BASH'
 #!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
+set -Eeuo pipefail
+cd "$(dirname "$0")/../../.."
 source .venv/bin/activate
-: "${TASK_DEVICE:?需要 task-submit 分配设备}"
-: "${READY_RESULT_DIR:?先执行本页第1节}"
+: "${TASK_DEVICE:?需要task-submit分配设备}"
+: "${BATCH01_DIR:?需要第2节创建的结果目录}"
+trap 'rc=$?; printf "\n[BATCH01] FAILED exit=%s line=%s RESULT_DIR=%s\n" "$rc" "$LINENO" "$BATCH01_DIR"; exit "$rc"' ERR
 device="${TASK_DEVICE%%,*}"
-export ASCEND_PROCESS_LOG_PATH="$READY_RESULT_DIR/ascend"
-printf 'device=%s\n' "$device" | tee "$READY_RESULT_DIR/device.txt"
+export ASCEND_PROCESS_LOG_PATH="$BATCH01_DIR/ascend"
+export SIMPLER_REPORT_SCHEDULER_MODE=1
+printf 'device=%s\n' "$device" | tee "$BATCH01_DIR/device.txt"
+cat > "$BATCH01_DIR/cases.txt" <<'CASES'
+chain-aic|single_core_dag/test_single_core_dag.py|aic_chain_64 and not work8|0
+chain-aiv|single_core_dag/test_single_core_dag.py|aiv_chain_64|0
+fanout256|fanout_imbalance/test_fanout_imbalance.py|fanout_256|3
+fanout1024|fanout_imbalance/test_fanout_imbalance.py|fanout_1024|0
+spmd-aic8|spmd_multiblock_aic/test_spmd_multiblock_aic.py|aic_block_num_8|4
+spmd-aiv16|spmd_multiblock_aic/test_spmd_multiblock_aic.py|aiv_block_num_16|4
+mix3|single_block_mix/test_single_block_mix.py|burst16_mask3|4
+mix5|single_block_mix/test_single_block_mix.py|burst16_mask5|4
+mix6|single_block_mix/test_single_block_mix.py|burst16_mask6|4
+mix7|single_block_mix/test_single_block_mix.py|burst16_mask7|4
+ordinary-mix|single_block_mix/test_single_block_mix.py|ordinary_mix_interleaved|4
+graph-replay|graph_execution/test_graph_execution.py|record_then_replay_2d|4
+CASES
 run_case() {
-  local label="$1" path="$2" selection="$3"
-  printf '\n[READY_BENCH] START=%s\n' "$label"
-  python -m pytest "$path" -k "$selection" --platform a5 --device "$device" \
-    --rounds 55 --enable-chip-swimlane 0 -vv -s \
-    2>&1 | tee "$READY_RESULT_DIR/$label.log"
-  python -m simpler_setup.tools.strace_timing "$READY_RESULT_DIR/$label.log" \
-    --rounds-table > "$READY_RESULT_DIR/$label-timing.txt"
+  local log="$1" path="$2" selection="$3" rounds="$4" level="$5"
+  printf '\n[BATCH01] START=%s rounds=%s level=%s\n' "$log" "$rounds" "$level"
+  python -m pytest "tests/st/a5/host_build_graph/$path" -k "$selection" \
+    --platform a5 --device "$device" --rounds "$rounds" \
+    --enable-chip-swimlane "$level" -vv -s 2>&1 | tee "$log"
 }
 for rep in 1 2 3; do
-  run_case "chain-$rep" \
-    tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py \
-    'aic_chain_64 and not work8'
-  for count in 256 1024; do
-    run_case "fanout${count}-$rep" \
-      tests/st/a5/host_build_graph/fanout_imbalance/test_fanout_imbalance.py \
-      "fanout_${count}"
-  done
+  while IFS='|' read -r label path selection diagnostic_level; do
+    log="$BATCH01_DIR/l0/$label-$rep.log"
+    run_case "$log" "$path" "$selection" 55 0
+    python -m simpler_setup.tools.strace_timing "$log" --rounds-table \
+      > "$BATCH01_DIR/l0/$label-$rep-timing.txt"
+  done < "$BATCH01_DIR/cases.txt"
 done
-python - "$READY_RESULT_DIR" <<'PY'
+date -Iseconds > "$BATCH01_DIR/diagnostic-start.marker"
+while IFS='|' read -r label path selection level; do
+  if [[ "$level" == 0 ]]; then continue; fi
+  run_case "$BATCH01_DIR/diagnostic/$label.log" "$path" "$selection" 1 "$level"
+done < "$BATCH01_DIR/cases.txt"
+find outputs -name chip_swimlane_records.json -newer "$BATCH01_DIR/diagnostic-start.marker" \
+  -print -exec cp --parents {} "$BATCH01_DIR/diagnostic" \;
+python - "$BATCH01_DIR" <<'PY'
 import json
 import math
 import re
@@ -86,111 +129,66 @@ import statistics
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-summary = []
-for path in sorted(root.glob('*-timing.txt')):
-    text = path.read_text()
-    header = next((s for s in text.splitlines() if 'Round' in s and 'Host (us)' in s), '')
-    assert 'Device (us)' in header, f'Missing Device wall: {path}'
-    rows = [list(map(float, m.groups()[1:])) for m in
-            re.finditer(r'^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s*$', text, re.M)]
-    assert len(rows) == 55, f'Expected 55 rounds, got {len(rows)}: {path}'
-    result = {'case': path.stem.removesuffix('-timing'), 'samples': 50, 'discarded': 5}
-    for index, metric in enumerate(('host_us', 'device_us')):
-        values = sorted(row[index] for row in rows[5:])
-        result[metric] = {'median': statistics.median(values),
-                          'p95': values[math.ceil(.95 * len(values)) - 1]}
-    summary.append(result)
-assert len(summary) == 9, f'Expected 9 case batches, got {len(summary)}'
-output = json.dumps(summary, ensure_ascii=False, indent=2)
-(root / 'summary.json').write_text(output + '\n')
-print('\n[READY_BENCH] SUMMARY_BEGIN\n' + output + '\n[READY_BENCH] SUMMARY_END')
-print('[READY_BENCH] RESULT_DIR=' + str(root))
+cases = [s.split('|') for s in (root / 'cases.txt').read_text().splitlines() if s]
+assert len(cases) == 12 and len({s[0] for s in cases}) == 12
+summary, reply = [], ['[BATCH01] SUMMARY_BEGIN', 'case\trep\tn\thost_median_us\thost_p95_us\tdevice_median_us\tdevice_p95_us']
+for label, _, _, level in cases:
+    for rep in range(1, 4):
+        stem = root / 'l0' / f'{label}-{rep}'
+        log = stem.with_suffix('.log').read_text(errors='replace')
+        assert '[SCHEDULER-MODE]' in log, f'Missing actual scheduler report: {stem}'
+        text = Path(str(stem) + '-timing.txt').read_text()
+        header = next((s for s in text.splitlines() if 'Round' in s and 'Host (us)' in s), '')
+        assert 'Device (us)' in header, f'Missing Device wall: {stem}'
+        rows = [list(map(float, m.groups()[1:])) for m in
+                re.finditer(r'^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s*$', text, re.M)]
+        assert len(rows) == 55, f'Expected 55 rounds, got {len(rows)}: {stem}'
+        assert all(row[1] > 0 for row in rows), f'Invalid Device wall: {stem}'
+        result = {'case': label, 'rep': rep, 'samples': 50, 'discarded': 5}
+        for index, metric in enumerate(('host_us', 'device_us')):
+            values = sorted(row[index] for row in rows[5:])
+            result[metric] = {'median': statistics.median(values),
+                              'p95': values[math.ceil(.95 * len(values)) - 1]}
+        summary.append(result)
+        reply.append(f"{label}\t{rep}\t50\t{result['host_us']['median']:.2f}\t{result['host_us']['p95']:.2f}\t{result['device_us']['median']:.2f}\t{result['device_us']['p95']:.2f}")
+    if level != '0':
+        log = (root / 'diagnostic' / f'{label}.log').read_text(errors='replace')
+        assert '[SCHEDULER-MODE]' in log, f'Missing diagnostic scheduler report: {label}'
+reply.extend(['[BATCH01] SUMMARY_END', '[BATCH01] DIAGNOSTIC_JSON'])
+paths = sorted((root / 'diagnostic').rglob('chip_swimlane_records.json'))
+reply.extend(str(p.relative_to(root)) for p in paths)
+reply.extend([f'[BATCH01] diagnostic_json_count={len(paths)}', '[BATCH01] RESULT_DIR=' + str(root)])
+(root / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+(root / 'return.txt').write_text('\n'.join(reply) + '\n')
+print('\n'.join(reply))
 PY
 BASH
+bash -n "$BATCH01_DIR/run-batch01.sh"
+```
 
-bash -n PerformanceTest/run-ready-baseline.sh
-command -v task-submit
-task-submit --list 2>&1 | tee "$READY_RESULT_DIR/allocation.txt"
+解释：清单最后一列指定诊断等级，0表示不额外采集；全部case都做L0测量。55轮在同一进程内，丢弃前5轮避免启动影响；三个批次分别统计，不混为一个样本池。诊断一轮保留golden和模式检查，L4耗时不用作性能值。表格摘要取官方rounds-table输出，精度0.1µs，原始STRACE仍保存。
+
+## 4. 在一份设备分配内执行并回传
+
+```bash
+task-submit --list 2>&1 | tee "$BATCH01_DIR/allocation.txt"
 bash .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --timeout 7200 --max-time 7200 --device auto --device-num 1 \
-  --run "bash '$PWD/PerformanceTest/run-ready-baseline.sh'" \
-  2>&1 | tee "$READY_RESULT_DIR/allocation-run.log"
+  --run "bash '$BATCH01_DIR/run-batch01.sh'" \
+  2>&1 | tee "$BATCH01_DIR/allocation-run.log"
+printf '\n[BATCH01] RESULT_DIR=%s\n' "$BATCH01_DIR"
 ```
 
-**回传 SUMMARY_BEGIN 到 SUMMARY_END，以及 RESULT_DIR**。失败/skip、模式不是 resident、摘要断言失败时，该批无效；回传错误末尾并保留完整日志。摘要使用工具输出的0.1µs精度，原始 STRACE 仍保留更细信息。HBG 看 Device wall 和 Host wall，不套用 TMR 的 Orch/Sched 分解。
+解释：锁定一个设备后串行完成36个L0进程和9个诊断进程；两小时是排队/执行预算，不是性能样本时间。排队情况记录在allocation.txt。每项已有独立目的，不因前一项快或慢而自动跳过其他项；失败停机属于环境健康依赖。
 
-### 2.1 独立的小规模诊断
+**成功后先粘贴回传：** environment.txt中的源码/工具链/设备/队列配置、SUMMARY_BEGIN到SUMMARY_END之间36行摘要、DIAGNOSTIC_JSON列表和RESULT_DIR；同时保留完整environment.txt及build.log。没有JSON不代表通过了协议诊断，应回传原始日志检查。诊断case成功和严格协议审计是两件事。
 
-以下块创建新目录，测256 fanout的一轮level=3。1024开启高等级profiling可能因测量扰动超时，不作默认诊断。
+**失败时回传：** `[BATCH01] FAILED`、失败case、终端最后约100行、RESULT_DIR及已有environment.txt。不自行删日志、改容差、切legacy/sim或连续重跑。无SUMMARY时先用日志定位，不补写零值冒充测量。
 
-```bash
-DIAG_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-diagnostic"
-mkdir -p "$DIAG_DIR/ascend"
-export ASCEND_PROCESS_LOG_PATH="$DIAG_DIR/ascend"
-git rev-parse HEAD > "$DIAG_DIR/source-sha.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$DIAG_DIR/source.patch"
-date -Iseconds > "$DIAG_DIR/start-time.txt"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-  --run "set -o pipefail; '$PWD/.venv/bin/python' -m pytest \
-  tests/st/a5/host_build_graph/fanout_imbalance/test_fanout_imbalance.py \
-  -k fanout_256 --platform a5 --device \$TASK_DEVICE \
-  --rounds 1 --enable-chip-swimlane 3 -vv -s \
-  2>&1 | tee '$DIAG_DIR/run.log'"
-find outputs -name chip_swimlane_records.json -newer "$DIAG_DIR/start-time.txt" \
-  -print -exec cp --parents {} "$DIAG_DIR" \;
-printf '\n[READY_BENCH] DIAGNOSTIC_DIR=%s\n' "$DIAG_DIR"
-```
+完整结果在PerformanceTest/results的本次目录：cases.txt、source.patch、runtime哈希、36份L0原始日志/逐轮表、9份诊断日志、协议JSON、summary.json、return.txt与设备日志。提交前脱敏；默认忽略.log，需要回填的具体日志用git add -f。生成脚本不是runtime改动，不需要先将整个结果目录提交才能回传。
 
-回传诊断 run.log 的测试结果和 JSON 路径。缺 JSON 时保留日志。level=3 wall 与基线分开报告；state_probe/resolve 整段时间不是原子操作时间。该步骤尚未新增 FAA/CAS 计时。
+## 5. 收到第一批结果后如何形成下一批
 
-### 2.2 PR #2857 的 Mix 资源范围诊断
+第一批完成后先分析实际resident模式、数值、批间波动、同类任务的执行分布、Mix资源成员和Graph控制路径。不同用例计算量不同，不直接相减得出锁成本；kernel间隙也不能单独证明空闲核可以合法执行其他任务。
 
-短链/fanout不能覆盖双lane Mix。以下块在一个设备分配内运行现有Mix用例，L4每case一轮，保留数值检查并收集协议证据。这是功能/协作诊断，不能用来报告无profiling性能或证明空闲AIV的计算收益。
-
-```bash
-export MIX_RESULT_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-mix-l4"
-mkdir -p "$MIX_RESULT_DIR/ascend"
-git rev-parse HEAD > "$MIX_RESULT_DIR/source-sha.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$MIX_RESULT_DIR/source.patch"
-date -Iseconds > "$MIX_RESULT_DIR/start-time.txt"
-cat > "$MIX_RESULT_DIR/run-mix.sh" <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/../../.."
-source .venv/bin/activate
-: "${TASK_DEVICE:?需要设备分配}"
-: "${MIX_RESULT_DIR:?需要结果目录}"
-export ASCEND_PROCESS_LOG_PATH="$MIX_RESULT_DIR/ascend"
-for selection in chain16_mask3 chain16_mask5 chain16_mask6 chain16_mask7 ordinary_mix_interleaved; do
-  python -m pytest tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py \
-    -k "$selection" --platform a5 --device "${TASK_DEVICE%%,*}" \
-    --rounds 1 --enable-chip-swimlane 4 -vv -s \
-    2>&1 | tee "$MIX_RESULT_DIR/$selection.log"
-done
-BASH
-bash -n "$MIX_RESULT_DIR/run-mix.sh"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --timeout 3600 --max-time 3600 --device auto --device-num 1 \
-  --run "bash '$MIX_RESULT_DIR/run-mix.sh'" \
-  2>&1 | tee "$MIX_RESULT_DIR/allocation-run.log"
-find outputs -name chip_swimlane_records.json -newer "$MIX_RESULT_DIR/start-time.txt" \
-  -print -exec cp --parents {} "$MIX_RESULT_DIR" \;
-printf '\n[READY_BENCH] MIX_RESULT_DIR=%s\n' "$MIX_RESULT_DIR"
-```
-
-回传五个case的pytest结果及本次JSON。每cluster的资源预期：mask3→AIC+AIV0，mask5→AIC+AIV1，mask6→AIC控制者+AIV0+AIV1，mask7→三lane。未在active_mask中的AIC可只承担控制，不调用subtask kernel；无关AIV可跳过该任务义务，但其普通执行仍受自身后续admission约束。检查assigned/arrived/released与关闭证据，而不是只看kernel数量。协议证据采集后须使用同版本审计工具进一步核验；pytest通过本身不等于已经独立完成严格协议审计。
-
-## 3. 回传与提交
-
-基线回传environment.txt、summary.json、设备编号与RESULT_DIR；诊断回传各case结果和本次JSON路径。失败时回传错误末尾并保留完整日志。结果位于PerformanceTest/results，按[README结果模板](README.md#5-结果归因验收与下一步)记录假设、实际实现的指标及限制。不能把缺失的埋点数据填成0。
-
-```bash
-git status --short
-# 按实际目录逐个添加摘要、环境、CSV、源码与必要日志。
-# git add PerformanceTest/results/<本次目录>/summary.json
-# git add -f PerformanceTest/results/<本次目录>/<具体日志>.log
-git diff --cached --stat
-```
-
-源码SHA包含mdtest的文档提交，须同时记录上游基准、runtime哈希和源码patch；新增未跟踪文件额外保存。日志提交前脱敏，大型日志留真机并记录位置与校验值。不要将本页生成的临时执行脚本误认为新的生产runtime实现。
+后续按前置依赖推进：精确P/G/S成本需要新增每核统计/采样与导出；同group/跨group、生产者/消费者扩展需要专用基准；锁或执行许可放宽候选需要热点证据和协议论证。实现完成的项目中，彼此没有数据依赖的可以合并下一批执行，不强制一项一批。届时提供对应patch、构建命令、运行命令和验收口径；本页没有这些尚未实现的命令。
