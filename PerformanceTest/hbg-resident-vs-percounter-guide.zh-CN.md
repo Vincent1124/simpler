@@ -1,6 +1,6 @@
 # 每核 resident 与 percounter：从 Host、GM 到 AICore 的理解指南
 
-版本范围：每核 resident 以 2026-11-05 拉取的 `63ffeb8a8bd9b6527912fee87f6a8defdf82d5e0` 为准，默认 TICKET Ready pool / H8；percounter 固定为 PR #2814 的 `9769943a58f4d7580dd23e6f6eff93067e7e9bbc`。两者基线不同；本文没有新增硬件测试。旧 `142ee15a7` 的 owner inbox 与 Graph 回退仅作为历史说明。
+版本范围：每核 resident 以 2026-11-05 拉取的 `2a298d1ebf427a7b2b2286ea052bca733c0ece85` 为准，包含PR #2857，默认 TICKET Ready pool / H8；percounter 固定为 PR #2814 的 `9769943a58f4d7580dd23e6f6eff93067e7e9bbc`。两者基线不同；本文没有新增硬件测试。旧 `142ee15a7` 的 owner inbox 与 Graph 回退仅作为历史说明。
 
 阅读与测试：[离线 HTML](hbg-resident-vs-percounter-guide.html)、[真机操作与结果回填](README.md)。旧数据结构与性能证据保留在[历史 GM / Host 详解](hbg-resident-vs-percounter-gm-host.zh-CN.md)和[历史协作与性能分析](hbg-resident-vs-percounter-cooperation-performance.zh-CN.md)，其固定提交内容不能当作新版默认行为。
 
@@ -259,7 +259,7 @@ A 的完成核不是从 B 的“依赖列表中删除 A”，而是取走 A 自�
 
 ### 4.5 Ready pool 的 GM 组织与 group 规则
 
-当前默认TICKET/H8于PR #2864的bd131362e引入。63ffeb8a8相对它没有A5 HBG runtime目录改动。Ready pool包含128字节header、每队列16字节descriptor、256字节control，以及每位置8字节task_ref entries。head与reserved_tail各占独立128字节区域；entry初始INVALID，发布后本run不覆盖、不循环复用。Host按任务类型和目标group计算容量，不预排实际Ready顺序。
+当前默认TICKET/H8于PR #2864的bd131362e引入，2a298d1eb保留该队列协议，并包含PR #2857的Mix/admission优化。Ready pool包含128字节header、每队列16字节descriptor、256字节control，以及每位置8字节task_ref entries。head与reserved_tail各占独立128字节区域；entry初始INVALID，发布后本run不覆盖、不循环复用。Host按任务类型和目标group计算容量，不预排实际Ready顺序。
 
 ```text
 共享GM
@@ -295,9 +295,11 @@ A 的完成核不是从 B 的“依赖列表中删除 A”，而是取走 A 自�
 | ---- | -------------- | ---------- |
 | 纯AIC/AIV单block | 一个同类型核领取并执行 | 完成该任务的核 |
 | 纯AIC/AIV多block | 一核领取并推进admission；本次运行拓扑的同类型核成为成员，按协议争领block | 提交block完成计数、确认整个任务完成的核 |
-| Mix单/多block | 一AIC领取并推进admission；成员覆盖候选cluster全部lane，各AIC coordinator争领block、本cluster按active mask执行subtask | 收齐本组释放后，贡献整个任务最后一次block完成计数的coordinator |
+| Mix单/多block | 一AIC领取并推进admission；各候选cluster按active_mask并上AIC确定资源成员，各coordinator争领block、本cluster按active_mask执行subtask | 收齐本组所需释放后，贡献整个任务最后一次block完成计数的coordinator |
 
 group不限定执行团队。成员有资格参与，不保证都领取到block；Mix控制成员也不等于实际计算lane。后继推进者不一定是最初领取任务者。完成贡献通过FAA(completed_blocks,1)判断是否为最后一次，而不是单独观察某核kernel返回时刻。
+
+PR #2857不再对每个Mix固定要求三lane：mask3的资源为AIC+AIV0，mask5为AIC+AIV1，mask6仍需AIC控制者和两个AIV，mask7为三lane。各lane保存assigned_seq与前驱序号，以处理跳过的协作轮次和mailbox复用。无关AIV可不承担该Mix义务，但仍遵守自身后续admission执行许可。
 
 Ready发现与真正执行有两个优先级层面：AIC的普通/Mix队列按候选位置和游标轮换探测，没有绝对Mix优先。多block/Mix取得任务后发布admission；各核按共享日志顺序履行本地成员义务，类型不再单独排序。普通kernel入口要求本核没有pending/current义务，并已扫描到commit_tail；已经运行的kernel不抢占，未执行的普通候选可以暂存。
 
@@ -310,6 +312,8 @@ AIC自身Mix subtask返回后，可以处理完成事件、发现有限候选、
 因此不能说所有inbox都被移除，也不能说所有Graph节点都走计算pool。普通HBG DAG与Graph Definition调用/replay仍是不同概念；支持范围内的Definition调用现可走native resident，不再一律回退。新实现的具体限制应以最新源码和[Graph设计文档](../docs/zh-cn/design/a5-hbg-graph-task.md)为准，不将历史percounter或旧resident的支持结论外推。
 
 代码依据：[pool布局](../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)、[TICKET协议](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h)、[发布/领取](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h)、[admission](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h)、[控制节点](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h)。
+
+PR #2857还引入最后有效领取确认者发布的claim_seal，证明block已经领完，不表示执行完成；减少反复强读共享cursor，正向提示仍须原子确认，无证明时保留原强读路径。TaskControl由512增至640字节，task/cluster关闭标记由8增至128字节隔离原子区。同次有界服务可复用准备/提交校验和ACK预探测，重试不延用证明；错误/epoch/执行身份继续实时检查。配置/紧凑拓扑在READY后缓存，L0裁剪记录，局部NOP自旋按进展复位。这些变化减少协作开销，不删除Ready CAS或admission commit_lock。
 
 ## 5. 最终对照
 
@@ -330,8 +334,9 @@ AIC自身Mix subtask返回后，可以处理完成事件、发现有限候选、
 | 历史测量 | 起点→终点 | 收益含义 |
 | -------- | --------- | -------- |
 | resident，CSA | 已有 resident → 增加同轮负 Ready 探测复用 | Device 2.245264→2.0835975ms，下降7.20%；是局部增量，不是 legacy→resident 总收益 |
+| PR #2857，CSA/SWA | 冻结142ee15a7基线 → 同卡提取候选 | Device中位数CSA 3.132435→2.531305ms（−19.19%），SWA 1.076120→0.898628ms（−16.49%）；每组10次，首轮保留，无额外预热，不是当前main的新测量 |
 | percounter，Qwen3 | 含 Graph、默认 legacy → percounter | Device 29.767→22.751ms，下降23.6%；Host 31.182→24.291ms，下降22.1%；作者报告，不是对当前每核 resident 的比较 |
 
 性能需要同输入、同工具链、固定提交比较。这两组数字的基线、workload 和部分指标均不同，不能相加或用来判断每核 resident 整体只有7%的提升。实际选择还应检查形状支持、实际 scheduler mode，以及数值和协议验收；完整证据边界见协作与性能配套文档。
 
-新版Ready pool的设计目标不等于实测加速。[PR #2864无Graph测量](../docs/zh-cn/design/a5-hbg-graph-task/no-graph-performance.md)记录过性能门禁未通过；[Qwen记录](../docs/zh-cn/design/a5-hbg-graph-task/qwen-performance.md)也有退化，且固定候选、设备、PTO-ISA不同。不能将历史候选数字改标为63ffeb8a8的新测量，更不能单独归因于Ready pool。
+新版Ready pool的设计目标不等于实测加速。[PR #2864无Graph测量](../docs/zh-cn/design/a5-hbg-graph-task/no-graph-performance.md)记录过性能门禁未通过；[Qwen记录](../docs/zh-cn/design/a5-hbg-graph-task/qwen-performance.md)也有退化，且固定候选、设备、PTO-ISA不同。[PR #2857冻结报告](../tests/fdwic/pa_hbg/csa-swa-scheduler-optimization-20261103.md)包含同卡数值/身份/协议校验，但两个AICore候选仍慢于报告的AICPU对照。不能把这些历史结果改标为2a298d1eb的新测量，也不能将整组收益归到单项原子或Ready pool。
