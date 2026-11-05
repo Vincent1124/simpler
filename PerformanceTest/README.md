@@ -1,254 +1,153 @@
-# A5 resident Ready 队列性能测试：复制命令与结果回填
+# 核内 resident 任务发布、获取与调度：性能测量及并发优化计划
 
-代码基准：2026-11-05 拉取的 upstream/main `2a298d1ebf427a7b2b2286ea052bca733c0ece85`，已包含 PR #2857（`459b69a98`）。mdtest 合入此基准并保留文档，后续源码与结果在本分支维护。以下命令用于 **A5 Linux 真机的 Bash**，依次复制到同一个终端执行。当前尚未运行真机测量。
+**优化目标：在保持依赖、唯一执行、资源协议和退出正确性的前提下，识别任务发布、任务获取、任务调度中的串行与同步成本，判断哪些工作值得并发、分散或重叠执行，再用同卡性能对照验证收益。** 测试服务于resident内部优化，不以切换legacy/percounter或复述历史加速数字作为目标。
 
-最新代码核对：Ready pool 默认仍为 **TICKET / group width=8**，不是 PR #2857 新引入。此次变化主要在 Mix 资源成员、领取结束证明、关闭标记隔离、重复检查消减和本地自旋。设计见 [resident/percounter 指南](hbg-resident-vs-percounter-guide.zh-CN.md) 和 [离线 HTML](hbg-resident-vs-percounter-guide.html)。
+代码基准为upstream/main `2a298d1ebf427a7b2b2286ea052bca733c0ece85`，已含PR #2857；mdtest在此基础上维护测量改动。默认计算队列为TICKET Ready pool/H8，Graph控制节点有独立inbox，admission有提交锁。基准不会因阅读文档自动更新，实测记录实际SHA和runtime哈希。当前没有新增真机测量或专用埋点数据。
 
-## 1. 测量对象与数据边界
+**操作入口：[可复制命令、基线与诊断回显](commands.zh-CN.md)。** 原有环境准备、L0计时、fanout/L3和Mix/L4命令均保留在该页；本页先定义测什么、如何归因、满足什么条件才能尝试并发。设计背景见[resident/percounter指南](hbg-resident-vs-percounter-guide.zh-CN.md)。
 
-| 路径 | 同步机制 | 测量重点 |
+## 1. 测量目标与阶段边界
+
+### 1.1 将三个阶段拆开，避免重复归因
+
+```text
+前驱整体完成
+  → 完成处理者遍历wake-list，检查/转挂后继依赖
+  → 后继被判定为Ready
+  → 本地batch → 按类型/group预留并发布Ready entry
+  → 消费者探测、CAS成功取得逻辑任务或保留直接候选
+      ├─ 普通单block：准备payload → 通过执行许可 → kernel
+      └─ 多block/Mix：提交admission → 成员发现义务
+                     → 任务内block领取/组内协作 → kernel
+  → block完成聚合 → 必要释放 → 任务整体完成 → 下一轮后继推进
+```
+
+| 阶段 | 测量边界 | 核心问题 |
 | ---- | -------- | -------- |
-| 默认计算 Ready pool | 按 AIC/AIV/Mix 类型、group 分队列；FAA 预留 entries，CAS 推进 head | FAA/CAS、entry 发布、跨组扫描 |
-| Graph 控制节点 | ENTER/EXIT 等进入独立 control inbox | endpoints CAS、控制节点与 wake-list 处理 |
-| 历史 owner inbox | 代码保留，默认计算任务不走它 | endpoints CAS、链指针等待、directory |
+| 发布P | 从完成处理/依赖路由，到Ready工作完成发布；分别统计路由、batch与队列发布 | 发布慢是wake-list逐项处理、批量延迟、FAA热点，还是写入/可见性成本？ |
+| 获取G | 一次Ready探测到成功领取/暂未取得；另外记录重复轮询和跨group探测 | 多消费者是否竞争同一个head？队首未发布是否挡住已有工作？ |
+| 调度S | 取得逻辑工作后，直到对应执行核通过许可并进入kernel；拆成准入、block分配、资源等待与准备 | 是提交锁、义务顺序、Mix等待、payload准备，还是本核前一个kernel占用？ |
+| 整体E | 完整一次run的Device wall，Host wall另列 | 局部控制成本下降，最终是否缩短业务执行时间？ |
 
-TICKET 是位置预留，不是持有式 ticket lock；admission 发布锁是另一项成本。基线命令可直接获取 Host/Device wall；level=3 可观察调度记录，均不能直接给出 CAS 的 ns/次。已有 ready_cas_retry_count 主要覆盖 TICKET 领取 CAS，不覆盖 FAA；其余计数未被通用 swimlane 完整导出。不能将整个 Device wall 或 profiling 扰动称作锁耗时。
+调度阶段要区分两个层次：Ready pool取得的是逻辑任务，admission之后还可能由其他核领取block。不能把最初领取核的计时直接当作所有参与核的调度延迟。直接后继候选绕过pool，应计入单独路径，不可漏算或按零队列成本混入平均。
 
-### 1.1 PR #2857 优化及测量边界
+### 1.2 期望交付的结论
 
-| 改动 | 原理与仍保留的约束 |
-| ---- | ------------------ |
-| Mix资源集合缩小 | resource_mask=active_mask并上AIC；AIC+AIV0不再等无关AIV1，AIC+AIV1同理；双AIV的Mix仍含AIC控制者 |
-| per-lane分配身份 | mailbox保存assigned_seq与各lane前驱，部分lane不参与某轮时仍可安全复用描述符 |
-| claim_seal结束证明 | 最后有效block领取确认者发布；正向提示仍需原子确认，缺证明仍走强cursor读取；不等于任务执行完成 |
-| 关闭标记隔离 | 每task/cluster独立128字节原子区，减少共享区域干扰并保留跨mailbox复用的关闭证据 |
-| 有界检查复用 | 同次服务复用固定配置、准备/提交校验、ACK预探测；重试丢弃证明，错误、epoch和真实身份不缓存成许可 |
-| 热路径减少 | 缓存READY后的只读拓扑与配置，按profiling裁剪记录；NOP自旋按进展复位，初始8、idle上限1024、启动/退出上限256 |
+每个优化结论必须包含：热点位置和作用范围、触发条件、无竞争/有竞争的成本、并发扩展曲线、对Device wall的影响，以及候选改动的正确性边界。没有直接测量时只列假设，不写“锁占比X%”或“增加并发必然加速”。
 
-GM也有成本：TaskControl从512到640字节；Mix关闭标记从8到128字节/task/cluster；新增量约`128*task_count + 120*mix_tasks*cluster_count`字节，另计对齐；本地admission状态增加32字节。不能只比较耗时而不记录图大小、资源mask与布局版本。
+## 2. 串行与同步假设：逐项证实或排除
 
-[PR保留报告](../tests/fdwic/pa_hbg/csa-swa-scheduler-optimization-20261103.md)的冻结对照以142ee15a7为起点，同卡每组10次、L0、包含首轮且无额外预热：CSA Device中位数3.132435→2.531305ms（−19.19%），SWA 1.076120→0.898628ms（−16.49%）。这是整组优化效果，且两者仍慢于该报告的AICPU对照；不是单项锁收益，也不是当前整合main的新测量。原报告前段的“排除native Graph”描述冻结提取边界，不能外推成当前main不支持Graph。
+| 编号 | 当前位置与假设 | 串行/等待范围 | 需要测出的证据 |
+| ---- | -------------- | ------------- | -------------- |
+| P1 | 同group的FAA预留可能形成发布热点 | 单队列reserved_tail，不是全芯片一把锁 | 每批预留延迟、总发布吞吐随生产者数量的变化 |
+| P2 | wake-list路由和batch收集可能延迟后继可见 | 单个完成处理者/本地批次 | 路由条数和耗时、首批发布延迟、批大小分布 |
+| G1 | 同group消费者CAS竞争head | 单队列领取位置 | CAS成功/失败延迟、重试、每成功领取服务时间、吞吐饱和点 |
+| G2 | 较早区间已预留未发布，阻塞队首 | 该队列；其他组仍可能有工作 | 队首发布空洞、持续探测、其他已发布工作是否可领取 |
+| G3 | 远端探测或无效轮询成本过高 | 本核控制循环 | 扫描组数、成功/失败探测次数、远端优先命中率 |
+| S1 | admission commit_lock竞争 | 共享日志提交临界区 | 成功/失败取锁、持锁时间、首次尝试到提交成功的总延迟 |
+| S2 | admission义务顺序限制普通kernel进入 | 涉及成员及本地frontier，不等于全任务全局串行 | 许可拒绝原因、候选持有时间、关义务前后的可执行空隙 |
+| S3 | block领取/结束确认形成共享热点 | 单逻辑任务 | 领取计数器开销、claim_seal命中/强读回退、block完成聚合开销 |
+| S4 | Mix到达与释放等待形成组内空隙 | 本cluster的resource_mask | 每lane到达/释放等待、慢lane来源、block之间的空隙 |
+| S5 | 单核非抢占执行与重复校验/自旋占用控制时间 | 单个AIC/AIV | kernel与调度服务时间分开，固定检查/ACK确认/自旋分项 |
+| C1 | Graph控制inbox和控制节点路由产生额外热点 | 各control inbox及其处理者 | endpoints CAS/链等待、控制节点预算与延后处理次数 |
 
-本页基线则采用同进程5轮预热后50轮、三个批次，统计口径不同；不能直接用它复现或替换上述百分比。普通协议记录为v8，native Graph为v9，旧审计器或固定“三lane成员”预期不适用于新版。
+FAA/CAS为同一原子位置建立唯一更新顺序，但不等于持锁执行整段调度。入队FAA与出队CAS所在区域已分离；不同group可并发。commit_lock确实串行提交记录，但其持有范围不包含kernel执行和等待lane，不能把两者混称“调度锁”。
 
-## 2. 同步、构建与环境回显
+代码对应：[Ready发布与获取](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h)、[TICKET原语](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h)、[admission](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h)、[Mix](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h)、[Graph控制路径](../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h)。
 
-在真机 simpler 根目录执行。快进更新不会覆盖已有结果/源码，遇到冲突回传现场，不要 reset/clean。尚未有仓库时，先克隆个人 fork 并进入仓库。
+## 3. 实验设计：从现状到因果对照
 
-```bash
-set -euo pipefail
-git fetch origin mdtest
-git switch mdtest
-git merge --ff-only origin/mdtest
-test "$(git branch --show-current)" = mdtest
-git status --short
-git log -1 --format='%H %s'
-# 若尚未加载 CANN，先按本机位置 source 对应 set_env.sh。
-test -n "${ASCEND_HOME_PATH:-}" || { printf '请先加载 CANN set_env.sh\n'; exit 1; }
-test -x .venv/bin/python || python3 -m venv --system-site-packages .venv
-source .venv/bin/activate
-export READY_RESULT_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-baseline"
-mkdir -p "$READY_RESULT_DIR/ascend"
-python -m pip install --no-build-isolation -e . 2>&1 | tee "$READY_RESULT_DIR/build.log"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-{
-  git log -1 --format='%H %s'
-  git status --short
-  cat pto_isa.pin
-  python --version
-  printf 'CANN=%s\n' "$ASCEND_HOME_PATH"
-  command -v ccec
-  command -v task-submit || true
-  npu-smi info || task-submit --run 'npu-smi info'
-  test ! -f /usr/local/Ascend/driver/version.info || cat /usr/local/Ascend/driver/version.info
-  find "$ASCEND_HOME_PATH" -maxdepth 2 -name version.info -type f -print -exec cat {} \;
-  find build/lib/a5 -type f -name '*.so' -exec sha256sum {} \;
-  rg -n 'kReadyPoolGroupWidth|kReadyPoolKind' src/a5/runtime/host_build_graph/host/runtime_maker.cpp
-} 2>&1 | tee "$READY_RESULT_DIR/environment.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$READY_RESULT_DIR/source.patch"
-printf '\n[READY_BENCH] RESULT_DIR=%s\n' "$READY_RESULT_DIR"
-```
+### 3.1 分四阶段推进
 
-**回传 environment.txt 与失败时的末尾输出**。预期 A5 检查通过、mdtest、TICKET/8 和设备列表。缺少 task-submit 时先停止，说明设备编号和独占情况，再安排不加锁的测试。新增未跟踪源码不在 source.patch 中，需额外保存提交。
+| 阶段 | 做什么 | 状态与产物 |
+| ---- | ------ | ---------- |
+| A：现状基线 | 固定代码/二进制/输入，L0测Device；另跑L3/L4观察分布与协议 | 命令现成，尚未真机执行；得到wall、轨迹和正确性记录，不能独立归因到锁 |
+| B：成本分解 | 增加每核计数与采样时间，覆盖第2节假设；记录埋点扰动 | 需实现埋点和导出；得到P/G/S分项，缺项标N/A |
+| C：并发扩展 | 专用微基准控制生产者、消费者、队列共享程度与批大小 | 需实现部分基准；得到低竞争/高竞争曲线与热点证据 |
+| D：安全候选验证 | 每次只改一个机制，先验协议，再同卡L0交替A/B/B/A | 尚未实施；得到候选patch、正确性结果、wall收益及回归范围 |
 
-## 3. 基线与诊断命令
+目前可复制命令只覆盖A。不能运行现有fanout后，就宣称B/C/D已经完成。L0时间用于性能判定；L3/L4和分项埋点用于诊断，两者分别报告。
 
-先整块复制生成脚本。每 case 一个进程内执行55轮，固定丢弃前5轮后统计50轮；每 case 三个独立进程，保留 golden 校验，level=0。短链可能走直接候选；fanout 由一个 root 释放后继，不代表所有多生产者竞争。
+### 3.2 用例与对照矩阵
 
-```bash
-cat > PerformanceTest/run-ready-baseline.sh <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-source .venv/bin/activate
-: "${TASK_DEVICE:?需要 task-submit 分配设备}"
-: "${READY_RESULT_DIR:?先执行第2节}"
-device="${TASK_DEVICE%%,*}"
-export ASCEND_PROCESS_LOG_PATH="$READY_RESULT_DIR/ascend"
-printf 'device=%s\n' "$device" | tee "$READY_RESULT_DIR/device.txt"
-run_case() {
-  local label="$1" path="$2" selection="$3"
-  printf '\n[READY_BENCH] START=%s\n' "$label"
-  python -m pytest "$path" -k "$selection" --platform a5 --device "$device" \
-    --rounds 55 --enable-chip-swimlane 0 -vv -s \
-    2>&1 | tee "$READY_RESULT_DIR/$label.log"
-  python -m simpler_setup.tools.strace_timing "$READY_RESULT_DIR/$label.log" \
-    --rounds-table > "$READY_RESULT_DIR/$label-timing.txt"
-}
-for rep in 1 2 3; do
-  run_case "chain-$rep" \
-    tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py \
-    'aic_chain_64 and not work8'
-  for count in 256 1024; do
-    run_case "fanout${count}-$rep" \
-      tests/st/a5/host_build_graph/fanout_imbalance/test_fanout_imbalance.py \
-      "fanout_${count}"
-  done
-done
-python - "$READY_RESULT_DIR" <<'PY'
-import json
-import math
-import re
-import statistics
-import sys
-from pathlib import Path
-root = Path(sys.argv[1])
-summary = []
-for path in sorted(root.glob('*-timing.txt')):
-    text = path.read_text()
-    header = next((s for s in text.splitlines() if 'Round' in s and 'Host (us)' in s), '')
-    assert 'Device (us)' in header, f'Missing Device wall: {path}'
-    rows = [list(map(float, m.groups()[1:])) for m in
-            re.finditer(r'^\s*(\d+)\s+([\d.]+)\s+([\d.]+)\s*$', text, re.M)]
-    assert len(rows) == 55, f'Expected 55 rounds, got {len(rows)}: {path}'
-    result = {'case': path.stem.removesuffix('-timing'), 'samples': 50, 'discarded': 5}
-    for index, metric in enumerate(('host_us', 'device_us')):
-        values = sorted(row[index] for row in rows[5:])
-        result[metric] = {'median': statistics.median(values),
-                          'p95': values[math.ceil(.95 * len(values)) - 1]}
-    summary.append(result)
-assert len(summary) == 9, f'Expected 9 case batches, got {len(summary)}'
-output = json.dumps(summary, ensure_ascii=False, indent=2)
-(root / 'summary.json').write_text(output + '\n')
-print('\n[READY_BENCH] SUMMARY_BEGIN\n' + output + '\n[READY_BENCH] SUMMARY_END')
-print('[READY_BENCH] RESULT_DIR=' + str(root))
-PY
-BASH
+| 组别 | 控制方式 | 覆盖问题与限制 |
+| ---- | -------- | -------------- |
+| W0独立短任务/短链 | 同样计算kernel与固定总工作量，分别观察低队列压力与大量独立工作 | 对照调度间隔；短链可能走直接候选，本身不能证明队列成本 |
+| W1单发布者fanout | 256/1024等规模，记录实际batch和各组分布 | 现成fanout可建立分布基线；任务数不同的wall差不能直接算锁成本 |
+| W2多发布者/多消费者 | 专用基准固定总操作数，生产者与消费者分别取1/2/4/8并按真实拓扑扩展 | 隔离发布P1与领取G1；实际并发数须验证，不假设全部激活核都在操作 |
+| W3集中与分散队列 | 相同并发数/操作量，专用基准分别访问同队列和不同队列 | 识别共享热点；当前默认hash不提供任意路由CLI，不能假装已有开关 |
+| W4发布窗口 | 专用基准有界延迟较早entry发布，保证最终发布且不执行等待kernel | 观察G2队首阻塞；诊断延迟是实验变量，不是生产优化 |
+| W5admission压力 | 独立协作任务并发提交，固定任务和计算工作，测提交锁与许可 | 锁等待和成员义务等待分开；改变任务粒度的实验还包含组织方式变化 |
+| W6Mix协作 | mask3/5/6/7做协议覆盖；固定mask再改变某参与lane耗时 | mask之间计算工作不同，不能直接相减归因；同mask才分析慢lane与协调成本 |
+| W7混合与Graph回归 | 普通+多block+Mix+sync-start+Graph，加入长短任务交错 | 检查并发候选是否破坏协议或造成饥饿；不是第一轮原子成本微基准 |
 
-bash -n PerformanceTest/run-ready-baseline.sh
-command -v task-submit
-task-submit --list 2>&1 | tee "$READY_RESULT_DIR/allocation.txt"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --timeout 7200 --max-time 7200 --device auto --device-num 1 \
-  --run "bash '$PWD/PerformanceTest/run-ready-baseline.sh'" \
-  2>&1 | tee "$READY_RESULT_DIR/allocation-run.log"
-```
+每个微基准至少保留无竞争对照；逐步改变一个变量，其余输入、任务语义、核数、计算量、内存布局与缓存策略记录清楚。并发度必须符合真实资源，sync-start不得超出可驻留容量。性能曲线看吞吐、每操作延迟与尾延迟，不只看一个百分比。
 
-**回传 SUMMARY_BEGIN 到 SUMMARY_END，以及 RESULT_DIR**。失败/skip、模式不是 resident、摘要断言失败时，该批无效；回传错误末尾并保留完整日志。摘要使用工具输出的0.1µs精度，原始 STRACE 仍保留更细信息。HBG 看 Device wall 和 Host wall，不套用 TMR 的 Orch/Sched 分解。
+### 3.3 必须新增的指标和数据格式
 
-### 3.1 独立的小规模诊断
+| 类别 | 最小字段/统计 |
+| ---- | ------------- |
+| 身份 | run、源码/patch、worker/core_type、queue/group、task/block、generation、协议版本 |
+| 发布 | 路由服务时间/条数、batch任务数、FAA预留次数/ticks、entry发布次数/ticks |
+| 获取 | 探测次数与结果、CAS尝试/成功/失败ticks、成功领取、跨组扫描、空洞相关状态 |
+| 调度 | 提交尝试/失败、取锁延迟与持锁ticks、普通许可拒绝原因、block领取、准备与进入kernel |
+| 协作 | resource_mask、assigned/arrived/released、等待ticks、claim_seal、强读回退、本地关闭 |
+| 运行 | 每核kernel/控制服务/等待分布、实际执行身份、Device/Host wall、golden与退出结果 |
 
-以下块创建新目录，测256 fanout的一轮level=3。1024开启高等级profiling可能因测量扰动超时，不作默认诊断。
+按run和核先累计，按类型/group及结果分类；需要尾延迟时增加有界采样或直方图，仅有总ticks/次数算不出p95。热路径不逐条打印，不使用全局共享统计原子制造竞争。结束后一次导出每核独立GM区域；新增字段需同步布局、初始化、回写及Host解析。
 
-```bash
-DIAG_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-diagnostic"
-mkdir -p "$DIAG_DIR/ascend"
-export ASCEND_PROCESS_LOG_PATH="$DIAG_DIR/ascend"
-git rev-parse HEAD > "$DIAG_DIR/source-sha.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$DIAG_DIR/source.patch"
-date -Iseconds > "$DIAG_DIR/start-time.txt"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-  --run "set -o pipefail; '$PWD/.venv/bin/python' -m pytest \
-  tests/st/a5/host_build_graph/fanout_imbalance/test_fanout_imbalance.py \
-  -k fanout_256 --platform a5 --device \$TASK_DEVICE \
-  --rounds 1 --enable-chip-swimlane 3 -vv -s \
-  2>&1 | tee '$DIAG_DIR/run.log'"
-find outputs -name chip_swimlane_records.json -newer "$DIAG_DIR/start-time.txt" \
-  -print -exec cp --parents {} "$DIAG_DIR" \;
-printf '\n[READY_BENCH] DIAGNOSTIC_DIR=%s\n' "$DIAG_DIR"
-```
+现有ready_enqueue/batch/pop/steal/retry/giveup可复用，但需补导出。`Σretry / Σpop`是每成功领取的重试数，不是CAS失败率，不包含FAA；严格失败率应为失败尝试数/全部尝试数。NOT_READY不是全局空，也不一定是发布空洞；需结合head、reserved_tail与entry状态，且并发读取不是天然一致快照。没有配对证据时只能写“疑似空洞”。bootstrap、稳态、直接候选和Graph控制路径分别统计。
 
-回传诊断 run.log 的测试结果和 JSON 路径。缺 JSON 时保留日志。level=3 wall 与基线分开报告；state_probe/resolve 整段时间不是原子操作时间。该步骤尚未新增 FAA/CAS 计时。
+时间只在相同计时域比较。发布服务完成可由发布核本地测量，但“远端消费者可见”不是同一事件；跨核Ready→领取、领取→远端执行的延迟需要验证时钟对齐并关联事件，否则不直接相减。`ns=ticks*1e9/timer_hz`按实际系统计时源频率换算。先测空计时框架和有/无埋点差异；校验计时器与原子完成顺序，保留原始计时和扰动，不用简单相减制造精确结论。
 
-### 3.2 PR #2857 的 Mix 资源范围诊断
+## 4. 由测量选择并发方案，并守住进展约束
 
-短链/fanout不能覆盖双lane Mix。以下块在一个设备分配内运行现有Mix用例，L4每case一轮，保留数值检查并收集协议证据。这是功能/协作诊断，不能用来报告无profiling性能或证明空闲AIV的计算收益。
+### 4.1 方案是假设，按证据选取
 
-```bash
-export MIX_RESULT_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-mix-l4"
-mkdir -p "$MIX_RESULT_DIR/ascend"
-git rev-parse HEAD > "$MIX_RESULT_DIR/source-sha.txt"
-git diff HEAD -- src python simpler_setup conftest.py > "$MIX_RESULT_DIR/source.patch"
-date -Iseconds > "$MIX_RESULT_DIR/start-time.txt"
-cat > "$MIX_RESULT_DIR/run-mix.sh" <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/../../.."
-source .venv/bin/activate
-: "${TASK_DEVICE:?需要设备分配}"
-: "${MIX_RESULT_DIR:?需要结果目录}"
-export ASCEND_PROCESS_LOG_PATH="$MIX_RESULT_DIR/ascend"
-for selection in chain16_mask3 chain16_mask5 chain16_mask6 chain16_mask7 ordinary_mix_interleaved; do
-  python -m pytest tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py \
-    -k "$selection" --platform a5 --device "${TASK_DEVICE%%,*}" \
-    --rounds 1 --enable-chip-swimlane 4 -vv -s \
-    2>&1 | tee "$MIX_RESULT_DIR/$selection.log"
-done
-BASH
-bash -n "$MIX_RESULT_DIR/run-mix.sh"
-bash .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --timeout 3600 --max-time 3600 --device auto --device-num 1 \
-  --run "bash '$MIX_RESULT_DIR/run-mix.sh'" \
-  2>&1 | tee "$MIX_RESULT_DIR/allocation-run.log"
-find outputs -name chip_swimlane_records.json -newer "$MIX_RESULT_DIR/start-time.txt" \
-  -print -exec cp --parents {} "$MIX_RESULT_DIR" \;
-printf '\n[READY_BENCH] MIX_RESULT_DIR=%s\n' "$MIX_RESULT_DIR"
-```
+| 测量证据 | 可试验方向 | 必须保留的边界 |
+| -------- | ---------- | -------------- |
+| P1/G1明显且分散队列改善吞吐 | 调整分组/发布分布，减少共享head与tail竞争 | 唯一领取、容量计划、同类型可达性与公平性 |
+| P2批次收集延迟大、原子成本占比高 | 调整有界批量，缩短首批可见时间或摊薄原子次数 | 顺序和可见性；不得预留后进入kernel/等依赖而留下发布空洞 |
+| G3无效探测多且远端工作可证实 | 有界扫描、同轮负探测复用、改进探测顺序 | 提示不能当成长期事实；保留重新探测与远端进展机会 |
+| S1锁提交成为瓶颈 | 缩短临界区、准备移到锁外、同次有界校验复用 | 提交顺序、记录完整发布、重试失效；不得持锁等核/任务完成 |
+| S2/S4有可利用的空隙 | 研究资源范围收缩、控制准备与计算重叠、有界候选 | 不能直接绕过admission顺序；候选持有不能饿死协作所需的工作 |
+| S3/S5反复检查多 | 利用经原子确认的结束证明、缓存只读配置、裁剪记录 | 领完不等于执行完；运行错误、epoch与执行身份实时验证 |
 
-回传五个case的pytest结果及本次JSON。每cluster的资源预期：mask3→AIC+AIV0，mask5→AIC+AIV1，mask6→AIC控制者+AIV0+AIV1，mask7→三lane。未在active_mask中的AIC可只承担控制，不调用subtask kernel；无关AIV可跳过该任务义务，但其普通执行仍受自身后续admission约束。检查assigned/arrived/released与关闭证据，而不是只看kernel数量。协议证据采集后须使用同版本审计工具进一步核验；pytest通过本身不等于已经独立完成严格协议审计。
+PR #2857已经采用资源mask收缩、claim_seal、独立关闭标记和有界检查复用。先测当前剩余成本，不将这些已有机制重新当成未实现方案。新增方案前检查仓库[既有调查](../docs/investigations/README.md)，避免重复已否定的方案。候选实验遵守现有协议，以测量证据决定改动范围。
 
-## 4. 精确耗时、归因与回填
+### 4.2 避免死锁/活锁的验收约束
 
-后续埋点直接在 mdtest 实现。本次只更新文档，不假定下面新增指标已经可读取。
+- 依赖未满足不进入kernel；task/block/subtask唯一执行，完成计数和真实执行身份一致。
+- Ready预留后有界完成发布，不持有发布区间去等待依赖/执行kernel；失败不能留下无人发布的空洞。
+- admission提交临界区不等待worker、kernel或其他任务完成；失败/重试必须释放自己持有的锁，不能复用失效许可。
+- 不能任意跳过本核成员义务或普通执行gate；并发资源获取需要一致顺序或可论证的无环等待关系，避免部分占有形成循环等待。
+- Mix按resource_mask、generation和各lane前驱检查到达/释放；不复用仍被使用的描述符，LocalDone不能替代TaskDone。
+- 长kernel不会被调度代码抢占；等待、完成处理、协作服务和退出必须保持可达。检查饥饿和无效重试，不能仅靠超时掩盖无进展。
+- exit、错误和重放后状态必须收敛；run资源在所有使用者退出前不回收。含Graph时核验当前v9，普通路径核验v8，不能用旧“三lane”预期。
 
-| 指标 | 位置与口径 |
-| ---- | ---------- |
-| FAA次数/ticks | scheduler_ticket_reserve；与CAS分开 |
-| entry发布条数/ticks | scheduler_ticket_publish；区分每批/每任务 |
-| CAS尝试/失败/ticks | scheduler_ticket_try_pop_batch及Mix placement专用分支 |
-| NOT_READY/RETRY | 区分entry未发布、容量末尾和竞争预算耗尽，不等于全局没工作 |
-| 跨组扫描数/ticks | scheduler_ready_pool_claim；包括每第四次远端优先 |
-| ready_enqueue/batch/pop/steal/retry/giveup | 从每核context导出；当前steal表示跨组领取 |
-| Graph控制inbox | endpoints CAS、链等待另计 |
-| admission commit_lock | 等待与持有时间另计，不混入Ready竞争 |
-| claim_seal与cursor | 证明命中/强读回退分别计数；区分“领完”和“执行完” |
-| Mix到达/释放等待 | 按resource_mask计所需ACK及等待时间；同时记录无关lane是否可推进 |
-| 自旋/重复校验 | NOP等待、固定配置验证与ACK强确认开销分开；L0与L4不能直接混比 |
+验证顺序：静态解释等待关系与所有权 → 最小并发功能用例 → 依赖链/多前驱/高fanout/两lane与三laneMix/sync-start/Graph → 有界故障与退出恢复 → 长短任务交错压力 → 同卡L0性能。预先设定观测窗口并留存故障日志；“超时/507018”需查设备原因，不能直接认作死锁。有限轮次不挂只能增加置信度，不能证明不存在死锁；协议论证和反例覆盖缺一不可。
 
-现有统计在 aicore_executor.cpp 的 publish_worker_stats 回写，Host 在 runtime_maker.cpp 的 publish_aicore_scheduler_profiling 收回。当前 TICKET 可算 `Σready_cas_retry_count / Σready_pop_count`，表示每次成功领取的重试数，不是严格失败率，也不覆盖 FAA。平均发布批大小为 `Σready_enqueue_count / Σready_batch_count`；零分母填 N/A，bootstrap与执行期分开。
+## 5. 结果归因、验收与下一步
 
-精确计时用每核本地统计，结束时一次回写，避免每次都写共享计数器制造竞争。测空计时框架，校验读计时器与原子完成的顺序。`ns = ticks × 1e9 / timer_hz`，不套计算核主频，不跨核相减时间戳。记录采样与计时扰动。
+一条可采纳结论应形成证据链：例如“同group共享程度增加 → 领取CAS服务/尾延迟增加且吞吐趋平 → 分散队列在相同工作量下改善 → 合法候选在同卡L0稳定缩短Device wall”。CAS重试多、某核空闲或wall变长，单独都不是瓶颈结论；成功原子也可能排队，重试少不等于成本低。
 
-微基准应覆盖独占字、多核独立字、多核共享字、单生产者多消费者、多生产者双向竞争、同/跨group；并发度从1/2/4/8起步。调用生产版helper才覆盖实际协议；纯CAS循环不等于完整queue成本。保留唯一执行与数值校验，不在使用中复用节点。
+| 需要回答 | 记录口径 |
+| -------- | -------- |
+| 当前成本多大 | 无竞争/有竞争ns每成功操作、各核服务时间、等待分布、吞吐与median/p95；写样本数 |
+| 串行作用范围 | 同queue、同任务、同cluster还是共享提交日志；说明其他范围是否仍有进展 |
+| 优化改善什么 | 队列服务、锁持有、探测、义务等待或核间空隙，逐项列证据 |
+| 最终收益 | 同卡L0的Device变化，Host另列；相同输入/二进制/工具链，候选与基线交替A/B/B/A |
+| 正确性与代价 | golden、唯一执行/协议、故障退出、饥饿；GM/本地状态、编译与埋点扰动 |
+| 能否保留 | 事先约定目标与允许回归范围；收益超过批间波动，主要相关场景无不可接受尾延迟退化 |
 
-检验串行限制需分层：同group head/reserved_tail热点、队首已预留未发布、admission提交锁、按序成员义务、单cluster Mix rendezvous、单核非抢占kernel。保持同任务量/核数，对比同组集中与分散发布；保持同计算工作，改变协作组织或参与lane耗时。仅看Device wall不能归因。资源mask改变时计算工作也可能改变，不能直接把mask3与mask7耗时差算成协议收益。
+不同核的服务时间可重叠，多核累计ticks/Device wall不是可节省墙钟比例；嵌套阶段也不能相加。profiling与微基准数据不能替代L0的业务收益；删除CAS、跳过gate、降低golden标准不是合法性能对照。改变Mix mask也可能改变计算量，不能将其耗时差直接称为同步收益。
 
-端到端保持同语义、同工具链，同卡独占、关闭profiling后交替A/B/B/A。不能删除CAS作为并发对照。多核累计原子服务时间除以Device wall，不是可节省墙钟比例；profiling增量不是锁成本。Ready pool有结构性改进目标，但[已有性能记录](../docs/zh-cn/design/a5-hbg-graph-task/no-graph-performance.md)仍有退化，不预设一定更快。
+### 5.1 统一回填模板
 
-### 4.1 结果回填
+每次写明实际完成阶段与未实现指标，结果存入`PerformanceTest/results/<时间戳>-<实验编号>-<版本>/`。沿用复制命令的目录也可，在记录中关联实验编号。保留environment、source SHA/patch、runtime哈希、输入/compute指纹、原始日志、逐轮表、summary、协议与数值结果。新增未跟踪源码额外保存；缺失指标写N/A而非0。
 
-| 结果目录 | 实测SHA/patch | pool/group | 设备/CANN/驱动 | 样本 | Device median/p95 | FAA/CAS | 结论 |
-| -------- | ------------- | ---------- | -------------- | ---- | ----------------- | ------- | ---- |
-| 待回填 | 2a298d1eb + mdtest文档/实际patch | TICKET/8 | | 每批50×3批 | | 尚未埋点 | 未真机测量 |
+| 实验ID/假设 | 阶段/已实现测量 | 版本与受控变量 | 低/高竞争结果 | 端到端与扰动 | 正确性/进展 | 结论与下一步 |
+| ----------- | --------------- | -------------- | ------------- | ------------ | ----------- | ------------ |
+| P1/G1等，待填 | A基线可执行；B/C待实现 | 2a298d1eb + 实际patch、T/H8 | N/A | N/A | 未真机测试 | 尚不能判断热点或选定并发方案 |
 
-数据放在 `PerformanceTest/results/<本次目录>/`。日志提交前脱敏；大型设备日志可留真机，提交摘要、位置和校验值。默认忽略.log，需要提交的具体日志使用git add -f，不要加入整个构建目录。
-
-```bash
-git status --short
-git add PerformanceTest/README.md
-# 按实际目录逐个添加摘要、环境、CSV、源码与必要日志。
-# git add PerformanceTest/results/<本次目录>/summary.json
-# git add -f PerformanceTest/results/<本次目录>/<具体日志>.log
-git diff --cached --stat
-```
+历史PR #2857的CSA/SWA 19.19%/16.49%是冻结提取版本整组结果，不是当前测量、单项锁收益或目标阈值；详见[原报告](../tests/fdwic/pa_hbg/csa-swa-scheduler-optimization-20261103.md)。本轮先执行[命令页](commands.zh-CN.md)建立A阶段，再依据轨迹决定B的埋点优先级。下一项源码工作应是测量/导出与专用基准，而不是未经证实地放宽调度顺序。
