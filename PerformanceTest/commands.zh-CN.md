@@ -4,6 +4,8 @@
 
 源码基准：mdtest合入的upstream `2a298d1eb`，默认TICKET/H8，包含PR #2857。以下在 **A5 Linux Bash、simpler仓库根目录、同一终端** 依次复制执行；本地尚未运行真机测试。本版适用于没有task-submit的机器，直接运行Bash脚本，由操作者指定设备。只生成测试包装脚本，不修改runtime算法、编译开关或任务协议。
 
+2026-11-05回传的error.md显示机器被识别为A3（Ascend910_9382，Short_SoC_version=Ascend910_93），不是本轮目标A5。预检拒绝是正常保护；旧命令直接对登录shell启用errexit，使预检失败连带退出SSH。新版把严格错误处理放在独立bash进程，外层处理失败返回；不对登录shell直接执行set -e，也不绕过架构预检。换到A5机器后再执行本轮；如果认为识别有误，先核对npu-smi与CANN平台信息，不改测试平台强行运行。
+
 ## 1. 第一批的目标、测试目的与产物
 
 目标是建立可复现的resident参照，确认实际调度模式、数值和执行链路，找出值得进一步分解的场景。**本批没有新增计时埋点，不能直接给出CAS/锁占比，也不能证明某并发方案更快或无死锁。**
@@ -31,30 +33,35 @@ Mix资源预期：mask3→AIC+AIV0，mask5→AIC+AIV1，mask6→AIC控制者+两
 
 ## 2. 准备代码、构建和环境记录
 
-以下准备是设备测试的共同前置条件，不需要先回传一次才能继续。已有源码改动/结果时先保留；快进失败就回传，不要reset/clean。尚未加载CANN时，先按真机实际位置source对应set_env.sh。
+以下准备是设备测试的共同前置条件，不需要先回传一次才能继续。已有源码改动/结果时先保留；快进失败就回传，不要reset/clean。尚未加载CANN时，先按真机实际位置source对应set_env.sh。代码块中的if、PREPARE、then/else/fi需要整块复制；准备失败只退出子进程，成功才生成PREPARED标记供后续步骤检查。venv在子进程中激活，后续执行脚本会自行再次激活。
 
 先查看设备列表，选择空闲且本批期间无人共用的设备；共享机器需与使用者约定使用时段。本脚本没有全局排队或设备锁，无法阻止其他程序占用同一卡。以下查询失败时回传错误，不自动提权。
 
 ```bash
-npu-smi info
+if npu-smi info; then
+  printf '设备查询完成，请核对芯片型号和设备编号。\n'
+else
+  printf '设备查询失败；请回传错误，SSH会话保留。\n'
+fi
 ```
 
 下面**只需按机器修改 `export BENCH_DEVICE=0` 这一行的编号**，不要同时填写多个设备。它是传给pytest/CANN的可见设备编号；若配置了可见设备映射，要核对映射，不能直接把芯片号或PCIe编号当作设备编号。
 
 ```bash
-set -euo pipefail
+export BENCH_DEVICE=0
+export BATCH01_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-batch01"
+if bash <<'PREPARE'
+set -Eeuo pipefail
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin mdtest
 git switch mdtest
 git merge --ff-only origin/mdtest
 test "$(git branch --show-current)" = mdtest
 git merge-base --is-ancestor 2a298d1ebf427a7b2b2286ea052bca733c0ece85 HEAD
-export BENCH_DEVICE=0
 [[ "$BENCH_DEVICE" =~ ^[0-9]+$ ]] || { printf 'BENCH_DEVICE必须是单个非负整数\n'; exit 1; }
 test -n "${ASCEND_HOME_PATH:-}" || { printf '请先加载CANN set_env.sh\n'; exit 1; }
 test -x .venv/bin/python || python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-export BATCH01_DIR="$PWD/PerformanceTest/results/$(date +%Y%m%d-%H%M%S)-batch01"
 mkdir -p "$BATCH01_DIR/ascend" "$BATCH01_DIR/l0" "$BATCH01_DIR/diagnostic"
 bash .claude/skills/onboard-arch-precheck/check.sh a5 2>&1 | tee "$BATCH01_DIR/arch.txt"
 python -m pip install --no-build-isolation -e . 2>&1 | tee "$BATCH01_DIR/build.log"
@@ -75,6 +82,13 @@ python -m pip install --no-build-isolation -e . 2>&1 | tee "$BATCH01_DIR/build.l
 } 2>&1 | tee "$BATCH01_DIR/environment.txt"
 git diff HEAD -- src python simpler_setup conftest.py > "$BATCH01_DIR/source.patch"
 printf '\n[BATCH01] RESULT_DIR=%s\n' "$BATCH01_DIR"
+touch "$BATCH01_DIR/PREPARED"
+PREPARE
+then
+  printf '\n[BATCH01] PREPARED：可以继续第3节。\n'
+else
+  printf '\n[BATCH01] 准备失败：停止后续步骤，SSH会话保留。RESULT_DIR=%s\n' "${BATCH01_DIR:-未设置}"
+fi
 ```
 
 解释：架构预检避免用错芯片；本地venv和重新构建避免加载旧runtime；SHA/PTO-ISA/runtime哈希固定版本证据。source.patch不含未跟踪的新源码，需额外保留。架构/构建失败时停止并回传现有日志，不自动换sim或legacy。环境记录明确标注本次未使用队列锁；开始/结束的设备快照不能证明整个运行期间无人共用，干扰情况需一并回传。
@@ -84,6 +98,10 @@ printf '\n[BATCH01] RESULT_DIR=%s\n' "$BATCH01_DIR"
 整块复制。case清单中的路径和筛选对应现有测试；`SIMPLER_REPORT_SCHEDULER_MODE=1`是已有诊断选项，记录实际模式，resident marker还会检查回退。L0与诊断分别落盘。某case失败时立即停止，防止后续测试使用异常设备状态；此前结果保留，不自动重试或重置设备。
 
 ```bash
+if bash <<'GENERATE'
+set -Eeuo pipefail
+: "${BATCH01_DIR:?请先执行第2节}"
+test -f "$BATCH01_DIR/PREPARED" || { printf '准备未成功，请先处理第2节错误。\n'; exit 1; }
 cat > "$BATCH01_DIR/run-batch01.sh" <<'BASH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -176,6 +194,12 @@ print('\n'.join(reply))
 PY
 BASH
 bash -n "$BATCH01_DIR/run-batch01.sh"
+GENERATE
+then
+  printf '\n[BATCH01] 脚本已生成并通过语法检查。\n'
+else
+  printf '\n[BATCH01] 脚本未生成：停止后续步骤，SSH会话保留。\n'
+fi
 ```
 
 解释：清单最后一列指定诊断等级，0表示不额外采集；全部case都做L0测量。55轮在同一进程内，丢弃前5轮避免启动影响；三个批次分别统计，不混为一个样本池。诊断一轮保留golden和模式检查，L4耗时不用作性能值。表格摘要取官方rounds-table输出，精度0.1µs，原始STRACE仍保存。
@@ -183,6 +207,10 @@ bash -n "$BATCH01_DIR/run-batch01.sh"
 ## 4. 在指定设备上直接执行并回传
 
 ```bash
+if bash <<'EXECUTE'
+set -Eeuo pipefail
+: "${BATCH01_DIR:?请先执行第2节}"
+test -f "$BATCH01_DIR/PREPARED" || { printf '准备未成功，请先处理第2节错误。\n'; exit 1; }
 : "${BENCH_DEVICE:?请先设置设备编号}"
 : "${BATCH01_DIR:?请先执行第2节}"
 bash .claude/skills/onboard-arch-precheck/check.sh a5
@@ -197,9 +225,15 @@ bash "$BATCH01_DIR/run-batch01.sh" 2>&1 | tee "$BATCH01_DIR/batch-run.log"
   npu-smi info
 } 2>&1 | tee "$BATCH01_DIR/device-after.txt"
 printf '\n[BATCH01] RESULT_DIR=%s\n' "$BATCH01_DIR"
+EXECUTE
+then
+  printf '\n[BATCH01] 全批执行完成，请按回传清单提供结果。\n'
+else
+  printf '\n[BATCH01] 执行失败：保留现场，SSH会话保留。RESULT_DIR=%s\n' "${BATCH01_DIR:-未设置}"
+fi
 ```
 
-解释：Bash前台顺序完成36个L0进程和9个诊断进程，设备编号来自BENCH_DEVICE；不需要安装调度工具，也不设置队列超时。保持终端会话，在整个运行期间避免其他工作共用该卡。开始/结束状态记录在device-before/after.txt，完整回显在batch-run.log。每项已有独立目的，不因前一项快或慢而自动跳过其他项；失败停机属于环境健康依赖。
+解释：独立Bash前台顺序完成36个L0进程和9个诊断进程，设备编号来自BENCH_DEVICE；不需要安装调度工具，也不设置队列超时。严格失败退出只作用于子进程，外层if处理其返回值，登录shell保留。保持终端会话，在整个运行期间避免其他工作共用该卡。开始/结束状态记录在device-before/after.txt，完整回显在batch-run.log。每项已有独立目的，不因前一项快或慢而自动跳过其他项；失败停机属于环境健康依赖。
 
 **成功后先粘贴回传：** environment.txt中的源码/工具链/设备/队列配置、SUMMARY_BEGIN到SUMMARY_END之间36行摘要、DIAGNOSTIC_JSON列表和RESULT_DIR；同时说明设备是否始终独占，保留device-before/after.txt、完整environment.txt及build.log。没有JSON不代表通过了协议诊断，应回传原始日志检查。诊断case成功和严格协议审计是两件事。
 
