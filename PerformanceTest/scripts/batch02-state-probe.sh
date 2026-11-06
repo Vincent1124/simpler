@@ -17,7 +17,8 @@ export ASCEND_PROCESS_LOG_PATH="$batch/ascend-state-probe"
 failed=0
 for mode in direct plain volatile inline_plain inline_volatile guarded; do
     printf 'STATE_PROBE %s\n' "$mode"
-    if python -m pytest PerformanceTest/cases/test_measurement_state.py::TestMeasurementState \
+    if python -m pytest -p tests.st.a5.host_build_graph.conftest \
+        PerformanceTest/cases/test_measurement_state.py::TestMeasurementState \
         --case "TestMeasurementState::$mode" --platform a5 --device "$TASK_DEVICE" \
         --manual include --rounds 1 --enable-chip-swimlane 0 -vv -s > "$batch/state-probe/$mode.log" 2>&1; then
         printf 'STATE_PROBE_PASS %s\n' "$mode"

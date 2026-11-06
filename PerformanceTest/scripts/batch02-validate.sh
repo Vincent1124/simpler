@@ -42,12 +42,24 @@ for path in files:
     assert data['mode'] == (1 if mode == 'count' else 2)
     assert data['period'] == (256 if mode == 'sample256' else 64)
     assert len(data['workers']) == data['worker_count']
+    identities = set()
     for worker in data['workers']:
+        assert worker['core_type'] in (0, 1)
+        assert worker['cluster_lane'] in ((0,) if worker['core_type'] == 0 else (1, 2))
+        identities.add((worker['cluster_index'], worker['cluster_lane']))
         for phase in worker['phases']:
             assert phase['admission_attempt'] == phase['admission_failure'] + phase['admission_success']
             assert phase['publish_entries'] == phase['reserve_entries']
         if mode == 'count':
             assert all(value['count'] == 0 for value in worker['timers'].values())
+    assert len(identities) == data['worker_count']
+    for core_type in (0, 1):
+        ranks = sorted(w['type_rank'] for w in data['workers'] if w['core_type'] == core_type)
+        assert ranks == list(range(len(ranks)))
+    if log.name.startswith('chain-aic-'):
+        assert sum(w['phases'][0]['reserve_entries'] for w in data['workers']) == 1
+        if mode.startswith('sample'):
+            assert sum(t['count'] for w in data['workers'] for t in w['timers'].values()) > 0
 print('VALIDATION=PASS', mode)
 PY
     done
