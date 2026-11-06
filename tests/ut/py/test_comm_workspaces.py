@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 from simpler.comm_domain import DomainConfig
 
+from simpler_setup.pto_isa import ensure_pto_isa_root
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -92,6 +94,7 @@ def host_resource_binary(request, tmp_path_factory):
     defines = []
     if rdma:
         defines.append("-DSIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1")
+    isa = Path(ensure_pto_isa_root())
     binary = build / "host_resources"
     subprocess.run(
         [
@@ -103,6 +106,7 @@ def host_resource_binary(request, tmp_path_factory):
             "-Wl,--gc-sections",
             *defines,
             f"-I{build}",
+            f"-I{isa}/include",
             f"-I{cann}/include",
             f"-I{cann}/pkg_inc/base",
             f"-I{ROOT}/src/a5/platform/include",
@@ -125,6 +129,16 @@ def host_resource_binary(request, tmp_path_factory):
 
 def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_resource_binary):
     subprocess.run([str(host_resource_binary)], check=True, timeout=20)
+
+
+@pytest.mark.parametrize("scenario", ["sdma_destroy", "urma_release", "urma_destroy", "destroy_exception"])
+def test_workspace_cleanup_failure_retains_owner(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize("host_resource_binary", [True], indirect=True)
+def test_rdma_workspace_free_failure_retains_owner(host_resource_binary):
+    subprocess.run([str(host_resource_binary), "rdma_release"], check=True, timeout=20)
 
 
 @pytest.mark.parametrize("kind", ["CommWorkspaceKind::COUNT", "static_cast<CommWorkspaceKind>(UINT32_MAX)"])
