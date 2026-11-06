@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -71,6 +72,8 @@ struct alignas(128) SchedulerMeasureHeader {
 };
 
 struct SchedulerMeasureLocal {
+    // Private scratch precedes the data passed through helper calls.
+    volatile uint64_t call_scratch[16]{};
     volatile SchedulerMeasureRecord record{};
     volatile uint64_t mode{0};
     volatile uint64_t period{0};
@@ -127,6 +130,7 @@ scheduler_measure_end(SchedulerMeasureLocal *local, SchedulerMeasureTimer timer,
 }
 
 static_assert(sizeof(SchedulerMeasureHeader) == 128);
+static_assert(offsetof(SchedulerMeasureLocal, record) == 128);
 static_assert(sizeof(SchedulerMeasureRecord) % 128 == 0);
 static_assert(std::is_standard_layout_v<SchedulerMeasureRecord>);
 static_assert(std::is_trivially_copyable_v<SchedulerMeasureRecord>);

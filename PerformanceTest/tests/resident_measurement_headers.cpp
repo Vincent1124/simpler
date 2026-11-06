@@ -19,6 +19,7 @@ int main() {
     assert(sizeof(SchedulerWorkerContext) == 1024);
     assert(sizeof(SchedulerGraphSummary) == 128);
     assert(sizeof(SchedulerMeasureRecord) == 640);
+    assert(offsetof(SchedulerMeasureLocal, record) == 128);
     SchedulerLocalState local;
     SchedulerMeasureLocal measurement;
     local.measurement = &measurement;
