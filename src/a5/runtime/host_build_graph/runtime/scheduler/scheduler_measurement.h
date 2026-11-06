@@ -71,11 +71,11 @@ struct alignas(128) SchedulerMeasureHeader {
 };
 
 struct SchedulerMeasureLocal {
-    SchedulerMeasureRecord record{};
-    uint64_t mode{0};
-    uint64_t period{0};
-    uint64_t sequence[SCHEDULER_MEASURE_TIMERS]{};
-    uint32_t phase{0};
+    volatile SchedulerMeasureRecord record{};
+    volatile uint64_t mode{0};
+    volatile uint64_t period{0};
+    volatile uint64_t sequence[SCHEDULER_MEASURE_TIMERS]{};
+    volatile uint32_t phase{0};
 };
 
 inline __aicore__ uint64_t scheduler_measure_clock() {

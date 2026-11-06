@@ -14,8 +14,8 @@
 #include "scheduler_measurement.h"
 #include "scheduler_memory.h"
 
-inline __aicore__ void scheduler_publish_measurement(
-    __gm__ SchedulerMeasureRecord *destination, const SchedulerMeasureRecord &source, bool finished
+__aicore__ __attribute__((noinline)) inline void scheduler_publish_measurement(
+    __gm__ SchedulerMeasureRecord *destination, const volatile SchedulerMeasureRecord &source, bool finished
 ) {
     destination->finished = 0;
     destination->run_epoch = source.run_epoch;
