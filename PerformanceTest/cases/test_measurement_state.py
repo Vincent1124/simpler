@@ -36,7 +36,8 @@ class TestMeasurementState(SceneTestCase):
                      "signature": [D.INOUT], "extra_include_dirs": EXTRA}],
     }
     CASES = [{"name": name, "platforms": ["a5"], "params": {"mode": mode}}
-             for name, mode in (("direct", 2), ("plain", 0), ("volatile", 1))]
+             for name, mode in (("direct", 2), ("plain", 0), ("volatile", 1),
+                                ("inline_plain", 3), ("inline_volatile", 4), ("guarded", 5))]
 
     def generate_args(self, params):
         return TaskArgsBuilder(TensorArg("state", torch.zeros(80, dtype=torch.int64)), Scalar("mode", params["mode"]))

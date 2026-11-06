@@ -17,6 +17,39 @@
 #include "scheduler/scheduler_measurement_publish.h"
 #include "tensor.h"
 
+struct alignas(128) GuardedMeasurement {
+    volatile uint64_t call_area[16]{};
+    SchedulerMeasureRecord record{};
+};
+
+template <typename Record>
+__aicore__ __attribute__((always_inline)) inline void
+copy_inline(__gm__ SchedulerMeasureRecord *destination, const Record &source) {
+    destination->run_epoch = source.run_epoch;
+    destination->worker_id = source.worker_id;
+    destination->finished = 0;
+    destination->overflow = source.overflow;
+    destination->core_type = source.core_type;
+    destination->cluster_index = source.cluster_index;
+    destination->cluster_lane = source.cluster_lane;
+    destination->type_rank = source.type_rank;
+    for (uint32_t phase = 0; phase < 2; ++phase)
+        for (uint32_t counter = 0; counter < SCHEDULER_MEASURE_COUNTERS; ++counter)
+            destination->counters[phase][counter] = source.counters[phase][counter];
+    for (uint32_t timer = 0; timer < SCHEDULER_MEASURE_TIMERS; ++timer) {
+        destination->timers[timer].count = source.timers[timer].count;
+        destination->timers[timer].sum = source.timers[timer].sum;
+        destination->timers[timer].minimum = source.timers[timer].minimum;
+        destination->timers[timer].maximum = source.timers[timer].maximum;
+        for (uint32_t bucket = 0; bucket < 4; ++bucket)
+            destination->timers[timer].buckets[bucket] = source.timers[timer].buckets[bucket];
+    }
+    for (uint32_t offset = 0; offset < sizeof(SchedulerMeasureRecord); offset += 64)
+        scheduler_publish_cache_line(reinterpret_cast<__gm__ uint8_t *>(destination) + offset);
+    destination->finished = 1;
+    scheduler_publish_cache_line(&destination->finished);
+}
+
 template <typename Record>
 __aicore__ __attribute__((always_inline)) inline void fill_record(Record &record) {
     record.run_epoch = 101;
@@ -53,6 +86,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         volatile SchedulerMeasureRecord record{};
         fill_record(record);
         scheduler_publish_measurement(destination, record, true);
+    } else if (args[1] == 3) {
+        SchedulerMeasureRecord record{};
+        fill_record(record);
+        copy_inline(destination, record);
+    } else if (args[1] == 4) {
+        volatile SchedulerMeasureRecord record{};
+        fill_record(record);
+        copy_inline(destination, record);
+    } else if (args[1] == 5) {
+        GuardedMeasurement guarded{};
+        fill_record(guarded.record);
+        scheduler_publish_measurement(destination, guarded.record, true);
     } else {
         words[0] = 101;
         words[1] = 3;

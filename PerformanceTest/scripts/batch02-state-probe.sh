@@ -15,7 +15,7 @@ export SIMPLER_RESIDENT_PERF=off
 export SIMPLER_REPORT_SCHEDULER_MODE=1
 export ASCEND_PROCESS_LOG_PATH="$batch/ascend-state-probe"
 failed=0
-for mode in direct plain volatile; do
+for mode in direct plain volatile inline_plain inline_volatile guarded; do
     printf 'STATE_PROBE %s\n' "$mode"
     if python -m pytest PerformanceTest/cases/test_measurement_state.py::TestMeasurementState \
         --case "TestMeasurementState::$mode" --platform a5 --device "$TASK_DEVICE" \
