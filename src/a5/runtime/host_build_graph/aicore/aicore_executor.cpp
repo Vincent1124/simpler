@@ -650,7 +650,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                     measurement.record.cluster_lane = scheduler_local_state.config.self_lane;
                     measurement.record.type_rank = context->type_rank;
                     for (uint32_t index = 0; index < SCHEDULER_MEASURE_TIMERS; ++index)
-                        measurement.sequence[index] = context->worker_index * 17 + index * 7;
+                        measurement.sequence[index] = context->worker_index * 17 + index * 7 + header->run_epoch * 13;
                     measurement_destination =
                         scheduler_state_at<SchedulerMeasureRecord>(scheduler_state_base, header->records_offset) +
                         context->worker_index;
@@ -794,7 +794,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     if constexpr (WithMeasurement) {
         if (measurement_destination != nullptr) {
             scheduler_publish_measurement(
-                measurement_destination, measurement.record, config_valid && scheduler_read_error(run_control) == 0
+                measurement_destination, measurement.record, config_valid && scheduler_read_error(run_control) == 0,
+                measurement.mode == 2
             );
         }
     }

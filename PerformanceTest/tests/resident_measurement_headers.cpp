@@ -58,6 +58,26 @@ int main() {
         for (uint32_t bucket = 0; bucket < 4; ++bucket)
             assert(sample.buckets[bucket] == timer * 10 + bucket);
     }
-    scheduler_publish_measurement(&published, measurement.record, false);
-    assert(published.finished == 0);
+    SchedulerMeasureRecord counted{};
+    scheduler_publish_measurement(&counted, measurement.record, true, false);
+    assert(counted.finished == 1 && counted.run_epoch == 7);
+    assert(counted.counters[1][1] == 101);
+    for (const auto &timer : counted.timers) {
+        assert(timer.count == 0 && timer.sum == 0);
+        for (auto bucket : timer.buckets)
+            assert(bucket == 0);
+    }
+    SchedulerMeasureRecord empty{};
+    empty.run_epoch = 8;
+    SchedulerMeasureRecord sparse{};
+    scheduler_publish_measurement(&sparse, empty, true);
+    assert(sparse.run_epoch == 8 && sparse.finished == 1);
+    for (const auto &phase : sparse.counters)
+        for (auto value : phase)
+            assert(value == 0);
+    for (const auto &timer : sparse.timers)
+        assert(timer.count == 0 && timer.sum == 0);
+    SchedulerMeasureRecord failed{};
+    scheduler_publish_measurement(&failed, measurement.record, false);
+    assert(failed.finished == 0);
 }
