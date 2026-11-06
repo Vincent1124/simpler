@@ -540,6 +540,19 @@ bool publish_resident_measurement(const Runtime *runtime, const HostApi *api) {
     if (std::any_of(records.begin(), records.end(), [&](const auto &record) {
             return record.finished != 1 || record.run_epoch != header.run_epoch || record.overflow != 0;
         })) {
+        for (size_t worker = 0; worker < std::min<size_t>(records.size(), 4); ++worker) {
+            const auto &record = records[worker];
+            LOG_ERROR(
+                "A5 HBG measurement worker=%zu observed=%" PRIu64 " epoch=%" PRIu64 " finished=%" PRIu64
+                " type=%" PRIu64 " cluster=%" PRIu64 " bootstrap_reserve=%" PRIu64 " run_reserve=%" PRIu64
+                " own_probe=%" PRIu64 " pop_success=%" PRIu64,
+                worker, record.worker_id, record.run_epoch, record.finished, record.core_type, record.cluster_index,
+                record.counters[0][static_cast<uint32_t>(SchedulerMeasureCounter::RESERVE_ENTRIES)],
+                record.counters[1][static_cast<uint32_t>(SchedulerMeasureCounter::RESERVE_ENTRIES)],
+                record.counters[1][static_cast<uint32_t>(SchedulerMeasureCounter::PROBE_OWN)],
+                record.counters[1][static_cast<uint32_t>(SchedulerMeasureCounter::POP_SUCCESS)]
+            );
+        }
         SchedulerRunControl control{};
         if (api->copy_from_device(
                 &control, reinterpret_cast<void *>(address + owner.layout.run_control_offset), sizeof(control)
