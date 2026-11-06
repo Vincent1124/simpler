@@ -96,7 +96,12 @@ inline void scheduler_measure_write_json(
         const auto &record = records[worker];
         if (record.worker_id != worker || record.run_epoch != header.run_epoch || record.finished != 1 ||
             record.overflow)
-            throw std::invalid_argument("resident measurement incomplete, stale or overflowed");
+            throw std::invalid_argument(
+                "resident measurement invalid worker=" + std::to_string(worker) +
+                " observed_worker=" + std::to_string(record.worker_id) + " epoch=" + std::to_string(record.run_epoch) +
+                " expected_epoch=" + std::to_string(header.run_epoch) + " finished=" + std::to_string(record.finished) +
+                " overflow=" + std::to_string(record.overflow)
+            );
         if (worker != 0) out << ',';
         out << "{\"worker_id\":" << worker << ",\"core_type\":" << record.core_type
             << ",\"cluster_index\":" << record.cluster_index << ",\"cluster_lane\":" << record.cluster_lane
