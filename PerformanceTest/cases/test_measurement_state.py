@@ -18,7 +18,8 @@ from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, sce
 ROOT = Path(__file__).resolve().parents[2]
 EXTRA = [str(ROOT / path) for path in (
     "src/a5/runtime/host_build_graph/runtime", "src/a5/runtime/host_build_graph/common",
-    "src/a5/platform/include", "src/a5/platform/onboard", "src/common/platform/include",
+    "src/a5/platform/include", "src/a5/platform/onboard", "src/a5/platform/onboard/aicore",
+    "src/common/platform/include",
     "src/common/task_interface", "src/common/log/include", "src/common",
 )]
 
