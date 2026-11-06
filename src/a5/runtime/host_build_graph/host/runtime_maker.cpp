@@ -537,6 +537,21 @@ bool publish_resident_measurement(const Runtime *runtime, const HostApi *api) {
         ) != 0)
         return false;
     std::ostringstream payload;
+    if (std::any_of(records.begin(), records.end(), [&](const auto &record) {
+            return record.finished != 1 || record.run_epoch != header.run_epoch || record.overflow != 0;
+        })) {
+        SchedulerRunControl control{};
+        if (api->copy_from_device(
+                &control, reinterpret_cast<void *>(address + owner.layout.run_control_offset), sizeof(control)
+            ) == 0) {
+            LOG_ERROR(
+                "A5 HBG measurement snapshot: executed=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
+                " scheduler_error=%" PRIu64 " error_site=%" PRIu64 " error_worker=%" PRIu64 " bootstrap=%" PRIu64,
+                control.executed_task_count, control.resolved_task_count, control.expected_task_count,
+                control.scheduler_error, control.error_site, control.error_worker_index, control.bootstrap_arrived_count
+            );
+        }
+    }
     scheduler_measure_write_json(payload, header, records);
     static std::atomic<uint64_t> sequence{0};
     const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
