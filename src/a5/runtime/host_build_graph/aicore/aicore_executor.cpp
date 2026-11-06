@@ -20,6 +20,7 @@
 #include "dispatch_payload.h"
 #include "runtime.h"
 #include "scheduler/scheduler_memory.h"
+#include "scheduler/scheduler_measurement_publish.h"
 #include "scheduler/scheduler_ready.h"
 #include "scheduler/scheduler_watchdog.h"
 
@@ -792,13 +793,9 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     // tail is optional, this ordering is not.
     if constexpr (WithMeasurement) {
         if (measurement_destination != nullptr) {
-            measurement.record.finished = config_valid && scheduler_read_error(run_control) == 0 ? 1 : 0;
-            const auto *source = reinterpret_cast<const uint64_t *>(&measurement.record);
-            auto *destination = reinterpret_cast<__gm__ uint64_t *>(measurement_destination);
-            for (uint32_t word = 0; word < sizeof(SchedulerMeasureRecord) / sizeof(uint64_t); ++word)
-                destination[word] = source[word];
-            for (uint32_t offset = 0; offset < sizeof(SchedulerMeasureRecord); offset += 64)
-                scheduler_publish_cache_line(reinterpret_cast<__gm__ uint8_t *>(measurement_destination) + offset);
+            scheduler_publish_measurement(
+                measurement_destination, measurement.record, config_valid && scheduler_read_error(run_control) == 0
+            );
         }
     }
     OUT_OF_ORDER_STORE_BARRIER();
