@@ -576,7 +576,7 @@ __aicore__ bool run_ready_dispatch_loop(
 
 struct SchedulerNoProfilingState {};
 
-template <bool WithProfiling, bool WithNativeGraph>
+template <bool WithProfiling, bool WithNativeGraph, bool WithMeasurement>
 __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
     uint64_t observed_profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
@@ -603,6 +603,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};
     SchedulerLocalState scheduler_local_state{};
     SchedulerAdmissionLocalState admission{};
+    std::conditional_t<WithMeasurement, SchedulerMeasureLocal, SchedulerNoProfilingState> measurement{};
+    __gm__ SchedulerMeasureRecord *measurement_destination = nullptr;
     if constexpr (WithProfiling) scheduler_local_state.profiling = &profile;
     // READY publishes a new image even when its GM address was used by an older
     // run. Observe it before local-config validation reads the native header.
@@ -616,6 +618,46 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     bool config_valid =
         native_extent_valid &&
         scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);
+    if (config_valid) {
+        if constexpr (WithMeasurement) {
+            auto *summary =
+                scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, context->graph_summary_offset);
+            const uint64_t offset = summary->measurement_offset;
+            const uint64_t bytes = context->scheduler_state_bytes;
+            config_valid = offset != 0 && offset % 128 == 0 && bytes >= sizeof(SchedulerMeasureHeader) &&
+                           offset <= bytes - sizeof(SchedulerMeasureHeader);
+            if (config_valid) {
+                auto *header = scheduler_state_at<SchedulerMeasureHeader>(scheduler_state_base, offset);
+                scheduler_observe_cache_line(header);
+                scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(header) + 64);
+                const uint64_t workers = context->runtime_worker_count;
+                config_valid =
+                    header->version == 1 && (header->mode == 1 || header->mode == 2) &&
+                    (header->period == 64 || header->period == 256) && header->worker_count == workers &&
+                    header->run_epoch == summary->run_epoch && workers <= SCHEDULER_WORKER_CAPACITY &&
+                    header->record_bytes == sizeof(SchedulerMeasureRecord) &&
+                    header->records_offset == offset + sizeof(SchedulerMeasureHeader) &&
+                    header->region_bytes == sizeof(SchedulerMeasureHeader) + workers * sizeof(SchedulerMeasureRecord) &&
+                    header->region_bytes <= bytes - offset;
+                if (config_valid) {
+                    measurement.mode = header->mode;
+                    measurement.period = header->period;
+                    measurement.record.run_epoch = header->run_epoch;
+                    measurement.record.worker_id = context->worker_index;
+                    measurement.record.core_type = context->core_type;
+                    measurement.record.cluster_index = context->cluster_index;
+                    measurement.record.cluster_lane = scheduler_local_state.config.self_lane;
+                    measurement.record.type_rank = context->type_rank;
+                    for (uint32_t index = 0; index < SCHEDULER_MEASURE_TIMERS; ++index)
+                        measurement.sequence[index] = context->worker_index * 17 + index * 7;
+                    measurement_destination =
+                        scheduler_state_at<SchedulerMeasureRecord>(scheduler_state_base, header->records_offset) +
+                        context->worker_index;
+                    scheduler_local_state.measurement = &measurement;
+                }
+            }
+        }
+    }
     if (config_valid) {
         config_valid = scheduler_initialize_admission(scheduler_state_base, &scheduler_local_state, &admission);
         if (config_valid && admission.capacity != 0) scheduler_local_state.admission = &admission;
@@ -643,6 +685,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     }
 
     // Sole AICore-wide DMB: after this point a prepared slot may execute.
+    if constexpr (WithMeasurement) measurement.phase = 1;
     uint32_t startup_signal = 0;
     bool register_release_timed_out = false;
     const uint64_t register_wait_start = get_sys_cnt_aicore();
@@ -747,7 +790,37 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     }
     // Complete preceding GM writes before ACK. Stays outside profiling: the
     // tail is optional, this ordering is not.
+    if constexpr (WithMeasurement) {
+        if (measurement_destination != nullptr) {
+            measurement.record.finished = config_valid && scheduler_read_error(run_control) == 0 ? 1 : 0;
+            const auto *source = reinterpret_cast<const uint64_t *>(&measurement.record);
+            auto *destination = reinterpret_cast<__gm__ uint64_t *>(measurement_destination);
+            for (uint32_t word = 0; word < sizeof(SchedulerMeasureRecord) / sizeof(uint64_t); ++word)
+                destination[word] = source[word];
+            for (uint32_t offset = 0; offset < sizeof(SchedulerMeasureRecord); offset += 64)
+                scheduler_publish_cache_line(reinterpret_cast<__gm__ uint8_t *>(measurement_destination) + offset);
+        }
+    }
     OUT_OF_ORDER_STORE_BARRIER();
+}
+
+template <bool WithProfiling, bool WithNativeGraph>
+__aicore__ void select_resident_measurement(
+    __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run, __gm__ void *base, uint64_t level,
+    uint64_t entry, uint64_t handshake
+) {
+    scheduler_observe_cache_line(&context->graph_summary_offset);
+    scheduler_observe_cache_line(&context->scheduler_state_bytes);
+    bool enabled = false;
+    if (context->scheduler_state_bytes >= sizeof(SchedulerGraphSummary) &&
+        context->graph_summary_offset <= context->scheduler_state_bytes - sizeof(SchedulerGraphSummary)) {
+        auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, context->graph_summary_offset);
+        scheduler_observe_cache_line(&summary->measurement_offset);
+        enabled = summary->measurement_offset != 0;
+    }
+    if (enabled)
+        run_resident_scheduler<WithProfiling, WithNativeGraph, true>(context, run, base, level, entry, handshake);
+    else run_resident_scheduler<WithProfiling, WithNativeGraph, false>(context, run, base, level, entry, handshake);
 }
 
 }  // namespace
@@ -867,24 +940,24 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     if (scheduler_task_timing_enabled(profiling_level) ||
         scheduler_gm_query(run_control->sampled_task_timing_enabled) != 0) {
         if (native_graph) {
-            run_resident_scheduler<true, true>(
+            select_resident_measurement<true, true>(
                 context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
                 handshake_publish_cycles
             );
         } else {
-            run_resident_scheduler<true, false>(
+            select_resident_measurement<true, false>(
                 context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
                 handshake_publish_cycles
             );
         }
     } else {
         if (native_graph) {
-            run_resident_scheduler<false, true>(
+            select_resident_measurement<false, true>(
                 context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
                 handshake_publish_cycles
             );
         } else {
-            run_resident_scheduler<false, false>(
+            select_resident_measurement<false, false>(
                 context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
                 handshake_publish_cycles
             );

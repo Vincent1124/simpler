@@ -17,6 +17,7 @@
 #include "scheduler_error.h"
 #include "scheduler_ssbuf.h"
 #include "scheduler_ready_pool.h"
+#include "scheduler_measurement.h"
 
 enum class SchedulerRouteResult : uint64_t {
     READY_TO_ENQUEUE = 1,
@@ -303,6 +304,7 @@ struct SchedulerControlResolveContinuation {
 };
 
 struct SchedulerLocalState {
+    SchedulerMeasureLocal *measurement{nullptr};
     SchedulerLocalConfig config{};
     SchedulerLocalProfilingState *profiling{nullptr};
     SchedulerAdmissionLocalState *admission{nullptr};
@@ -396,7 +398,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 632, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 640, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
@@ -1318,9 +1320,18 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
         } else {
             const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
             SchedulerTicketRange range{};
-            if (scheduler_ticket_reserve(queue, count, &range) != SchedulerTicketResult::SUCCESS ||
-                scheduler_ticket_publish(queue, range, refs) != SchedulerTicketResult::SUCCESS)
-                return false;
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_CALLS);
+            const uint64_t reserve_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::RESERVE);
+            const auto reserved = scheduler_ticket_reserve(queue, count, &range);
+            scheduler_measure_end(local->measurement, SchedulerMeasureTimer::RESERVE, reserve_start);
+            if (reserved != SchedulerTicketResult::SUCCESS) return false;
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_ENTRIES, count);
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_CALLS);
+            const uint64_t publish_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::PUBLISH);
+            const auto published = scheduler_ticket_publish(queue, range, refs);
+            scheduler_measure_end(local->measurement, SchedulerMeasureTimer::PUBLISH, publish_start);
+            if (published != SchedulerTicketResult::SUCCESS) return false;
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_ENTRIES, count);
             if (stats != nullptr) ++stats->batch_count;
         }
     }
@@ -1662,8 +1673,20 @@ inline __aicore__ bool scheduler_ready_pool_claim(
         const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
         int64_t ref = SCHEDULER_TASK_REF_INVALID;
         SchedulerTicketResult result = SchedulerTicketResult::RETRY;
+        scheduler_measure_add(
+            local->measurement,
+            group == own ? SchedulerMeasureCounter::PROBE_OWN : SchedulerMeasureCounter::PROBE_REMOTE
+        );
+        uint64_t measured_retries = 0;
+        const uint64_t pop_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::POP);
         if (placement == nullptr) {
-            result = scheduler_ticket_try_pop(queue, &ref, 2, stats == nullptr ? nullptr : &stats->cas_retry_count);
+            result = scheduler_ticket_try_pop(
+                queue, &ref, 2,
+                local->measurement != nullptr ? &measured_retries :
+                stats == nullptr              ? nullptr :
+                                                &stats->cas_retry_count
+            );
+            if (local->measurement != nullptr && stats != nullptr) stats->cas_retry_count += measured_retries;
         } else {
             // Placement is private to this coordinator. It must succeed before
             // shared ownership moves; unplaceable work stays globally visible.
@@ -1687,6 +1710,7 @@ inline __aicore__ bool scheduler_ready_pool_claim(
                     break;
                 }
                 if (!scheduler_plan_mix_placement(base, local, candidate, placement)) {
+                    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::MIX_UNPLACED);
                     result = SchedulerTicketResult::NOT_READY;
                     break;
                 }
@@ -1697,8 +1721,17 @@ inline __aicore__ bool scheduler_ready_pool_claim(
                     break;
                 }
                 if (stats != nullptr) ++stats->cas_retry_count;
+                ++measured_retries;
             }
         }
+        scheduler_measure_end(local->measurement, SchedulerMeasureTimer::POP, pop_start);
+        scheduler_measure_add(local->measurement, SchedulerMeasureCounter::POP_CAS_FAILURE, measured_retries);
+        if (result == SchedulerTicketResult::SUCCESS)
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::POP_SUCCESS);
+        else if (result == SchedulerTicketResult::NOT_READY)
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::POP_NOT_READY);
+        else if (result == SchedulerTicketResult::RETRY)
+            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::POP_RETRY);
         if (group != own) *cursor = (group + 1) % groups;
         if (result == SchedulerTicketResult::INVALID) {
             scheduler_record_error(

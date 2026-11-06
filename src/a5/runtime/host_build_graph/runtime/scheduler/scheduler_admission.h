@@ -391,8 +391,12 @@ static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
         scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_TOPOLOGY);
         return SchedulerAdmissionResult::ERROR;
     }
-    if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0)
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::ADMISSION_ATTEMPT);
+    if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0) {
+        scheduler_measure_add(local->measurement, SchedulerMeasureCounter::ADMISSION_FAILURE);
         return SchedulerAdmissionResult::RETRY;
+    }
+    const uint64_t commit_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::COMMIT);
     // Only this owner releases the lock, including a failed commit. No waiting
     // for a worker, kernel, ready queue, or task completion occurs under it.
     const uint64_t tail = scheduler_gm_query(shared->commit_tail);
@@ -412,6 +416,8 @@ static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
         if constexpr (RecordProtocol) scheduler_protocol_admission(base, local, task, tail, record->flags, false);
     }
     scheduler_gm_store(shared->commit_lock, UINT64_C(0));
+    scheduler_measure_end(local->measurement, SchedulerMeasureTimer::COMMIT, commit_start);
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::ADMISSION_SUCCESS);
     if (!valid) return SchedulerAdmissionResult::ERROR;
     admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
     return SchedulerAdmissionResult::PROGRESS;

@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <sys/resource.h>
 
 #include <cinttypes>
@@ -71,6 +72,7 @@
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
+#include "scheduler_measurement_export.h"
 #include "scheduler_protocol_graph_source.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
@@ -502,10 +504,52 @@ struct SchedulerStateOwner {
     const HostApi *api;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
+    SchedulerMeasurePlan measurement;
+    std::string measurement_directory;
 };
 
 std::mutex scheduler_state_owners_mutex;
 std::unordered_map<Runtime *, SchedulerStateOwner> scheduler_state_owners;
+
+bool publish_resident_measurement(const Runtime *runtime, const HostApi *api) {
+    SchedulerStateOwner owner{};
+    {
+        std::scoped_lock lock(scheduler_state_owners_mutex);
+        const auto it = scheduler_state_owners.find(const_cast<Runtime *>(runtime));
+        if (it == scheduler_state_owners.end() || it->second.measurement.offset == 0) return true;
+        owner = it->second;
+    }
+    SchedulerMeasureHeader header{};
+    const auto address = reinterpret_cast<uintptr_t>(owner.state_base);
+    if (api->copy_from_device(&header, reinterpret_cast<void *>(address + owner.measurement.offset), sizeof(header)) !=
+        0)
+        return false;
+    const auto &expected = owner.measurement.header;
+    if (header.version != expected.version || header.mode != expected.mode || header.period != expected.period ||
+        header.run_epoch != api->run_epoch() || header.worker_count != expected.worker_count ||
+        header.records_offset != expected.records_offset || header.record_bytes != sizeof(SchedulerMeasureRecord) ||
+        header.region_bytes != expected.region_bytes)
+        return false;
+    std::vector<SchedulerMeasureRecord> records(header.worker_count);
+    if (api->copy_from_device(
+            records.data(), reinterpret_cast<void *>(address + header.records_offset),
+            records.size() * sizeof(SchedulerMeasureRecord)
+        ) != 0)
+        return false;
+    std::ostringstream payload;
+    scheduler_measure_write_json(payload, header, records);
+    static std::atomic<uint64_t> sequence{0};
+    const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+    const std::filesystem::path directory(owner.measurement_directory);
+    std::filesystem::create_directories(directory);
+    const auto path =
+        directory / ("resident-" + std::to_string(getpid()) + "-" + std::to_string(stamp) + "-" +
+                     std::to_string(sequence.fetch_add(1)) + "-" + std::to_string(header.run_epoch) + ".json");
+    std::ofstream out(path);
+    out << payload.str();
+    out.close();
+    return !out.fail();
+}
 
 struct SchedulerJsonRecord {
     uint64_t start_cycles;
@@ -1577,6 +1621,20 @@ bool create_scheduler_state(
         return false;
     }
     layout.total_size = ready_pool_plan.total_size;
+    SchedulerMeasureConfig measurement_config;
+    try {
+        measurement_config =
+            scheduler_measure_config(std::getenv("SIMPLER_RESIDENT_PERF"), std::getenv("SIMPLER_RESIDENT_PERF_DIR"));
+    } catch (const std::exception &error) {
+        LOG_ERROR("A5 HBG: invalid resident measurement configuration: %s", error.what());
+        return false;
+    }
+    SchedulerMeasurePlan measurement;
+    if (!scheduler_measure_plan(layout.total_size, worker_count, api->run_epoch(), measurement_config, &measurement)) {
+        LOG_ERROR("A5 HBG: invalid resident measurement layout");
+        return false;
+    }
+    layout.total_size = measurement.total_size;
     layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
     layout.aic_worker_demand = aic_worker_demand;
@@ -1651,6 +1709,10 @@ bool create_scheduler_state(
     scheduler_init_ready_pool(host_base, ready_pool_plan);
     scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->ready_pool_offset =
         ready_pool_plan.header_offset;
+    scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->measurement_offset =
+        measurement.offset;
+    if (measurement.offset != 0)
+        *scheduler_state_at<SchedulerMeasureHeader>(host_base, measurement.offset) = measurement.header;
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
     for (int64_t task_ref : inline_completed_task_refs) {
         task_controls[task_ref].state = static_cast<int64_t>(SchedulerTaskState::DONE);
@@ -1737,7 +1799,7 @@ bool create_scheduler_state(
         scheduler_state_owners.emplace(
             runtime, SchedulerStateOwner{
                          reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
-                         std::move(protocol_source)
+                         std::move(protocol_source), measurement, measurement_config.directory
                      }
         );
     }
@@ -2814,6 +2876,18 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
 
     int rc = 0;
+
+    if (runtime != nullptr && execution_rc == 0 && launched != 0) {
+        try {
+            if (!publish_resident_measurement(runtime, api)) {
+                LOG_ERROR("A5 HBG: resident measurement copy/export failed");
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: resident measurement export failed: %s", error.what());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
 
     LOG_INFO("=== Copying Results Back to Host ===");
 

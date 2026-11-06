@@ -1070,7 +1070,7 @@ struct alignas(128) SchedulerGraphSummary {
     uint64_t protocol_layout_offset;
     SchedulerTopologyLayout topology_layout;
     uint64_t ready_pool_offset;
-    uint8_t cache_line_padding[8];
+    uint64_t measurement_offset;
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
