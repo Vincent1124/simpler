@@ -1278,6 +1278,27 @@ inline __aicore__ bool scheduler_ready_pool_service_pending(
     return true;
 }
 
+inline __aicore__ bool scheduler_ready_pool_publish_ticket(
+    SchedulerLocalState *local, SchedulerTicketQueueView queue, const int64_t *refs, uint32_t count,
+    SchedulerReadyStats *stats
+) {
+    SchedulerTicketRange range{};
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_CALLS);
+    const uint64_t reserve_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::RESERVE);
+    const auto reserved = scheduler_ticket_reserve(queue, count, &range);
+    scheduler_measure_end(local->measurement, SchedulerMeasureTimer::RESERVE, reserve_start);
+    if (reserved != SchedulerTicketResult::SUCCESS) return false;
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_ENTRIES, count);
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_CALLS);
+    const uint64_t publish_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::PUBLISH);
+    const auto published = scheduler_ticket_publish(queue, range, refs);
+    scheduler_measure_end(local->measurement, SchedulerMeasureTimer::PUBLISH, publish_start);
+    if (published != SchedulerTicketResult::SUCCESS) return false;
+    scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_ENTRIES, count);
+    if (stats != nullptr) ++stats->batch_count;
+    return true;
+}
+
 inline __aicore__ bool scheduler_ready_pool_push_batch(
     __gm__ void *base, SchedulerLocalState *local, uint32_t type, SchedulerReadyBatch *batch, SchedulerReadyStats *stats
 ) {
@@ -1287,7 +1308,6 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
     uint64_t remaining = batch->count;
     while (remaining != 0) {
         if (!scheduler_task_ref_valid(*local->config.graph, current)) return false;
-        const uint32_t group = scheduler_ready_pool_ref_group(current, pool.group_counts[type]);
         int64_t refs[8]{};
         uint32_t count = 0;
         do {
@@ -1302,8 +1322,7 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
             --remaining;
             if (remaining == 0 && (current != batch->tail || next != SCHEDULER_INBOX_EMPTY)) return false;
             current = next;
-        } while (remaining != 0 && count < 8 && current >= 0 &&
-                 scheduler_ready_pool_ref_group(current, pool.group_counts[type]) == group);
+        } while (remaining != 0 && count < 8 && current >= 0);
         if (pool.kind != SchedulerReadyPoolKind::TICKET) {
             const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
             SchedulerLinkedBatch prepared{};
@@ -1318,21 +1337,31 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
                     SchedulerLinkedResult::SUCCESS)
                 return false;
         } else {
-            const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
-            SchedulerTicketRange range{};
-            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_CALLS);
-            const uint64_t reserve_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::RESERVE);
-            const auto reserved = scheduler_ticket_reserve(queue, count, &range);
-            scheduler_measure_end(local->measurement, SchedulerMeasureTimer::RESERVE, reserve_start);
-            if (reserved != SchedulerTicketResult::SUCCESS) return false;
-            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::RESERVE_ENTRIES, count);
-            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_CALLS);
-            const uint64_t publish_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::PUBLISH);
-            const auto published = scheduler_ticket_publish(queue, range, refs);
-            scheduler_measure_end(local->measurement, SchedulerMeasureTimer::PUBLISH, publish_start);
-            if (published != SchedulerTicketResult::SUCCESS) return false;
-            scheduler_measure_add(local->measurement, SchedulerMeasureCounter::PUBLISH_ENTRIES, count);
-            if (stats != nullptr) ++stats->batch_count;
+            const uint32_t groups = pool.group_counts[type];
+            if (count == 1 || groups == 1) {
+                const uint32_t group = scheduler_ready_pool_ref_group(refs[0], groups);
+                const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
+                if (!scheduler_ready_pool_publish_ticket(local, queue, refs, count, stats)) return false;
+                continue;
+            }
+            uint32_t destinations[8];
+            for (uint32_t i = 0; i < count; ++i)
+                destinations[i] = scheduler_ready_pool_ref_group(refs[i], groups);
+            // Group within the window while preserving each queue's task order.
+            for (uint32_t i = 0; i < count; ++i) {
+                if (refs[i] == SCHEDULER_INBOX_EMPTY) continue;
+                const uint32_t group = destinations[i];
+                int64_t group_refs[8];
+                uint32_t group_count = 0;
+                for (uint32_t j = i; j < count; ++j) {
+                    if (destinations[j] == group) {
+                        group_refs[group_count++] = refs[j];
+                        refs[j] = SCHEDULER_INBOX_EMPTY;
+                    }
+                }
+                const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
+                if (!scheduler_ready_pool_publish_ticket(local, queue, group_refs, group_count, stats)) return false;
+            }
         }
     }
     scheduler_ready_batch_reset(batch);
