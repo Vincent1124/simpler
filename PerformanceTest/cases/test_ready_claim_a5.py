@@ -1,6 +1,7 @@
 """A5 sync-start cohort benchmark using the runtime's TICKET pop primitive."""
 import functools
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -93,8 +94,14 @@ def test_ready_claim(st_platform, st_device_ids, core):
                     for mode in layouts if repeat % 2 == 0 else layouts[::-1]:
                         result = measure(worker, handle, core, workers, mode, diagnostic)
                         assert worker.scheduler_runtime_mode in (1, 2)
-                        print("BATCH04_CLAIM " + json.dumps(dict(
+                        record = json.dumps(dict(
                             core=core, workers=workers, mode=mode, diagnostic=diagnostic,
-                            repeat=repeat, **result)), flush=True)
+                            repeat=repeat, **result))
+                        output = os.environ.get("BATCH04_CLAIM_OUTPUT")
+                        if output:
+                            with (Path(output) / f"core-{core}.jsonl").open("a", encoding="utf-8") as stream:
+                                stream.write(record + "\n")
+                        else:
+                            print("BATCH04_CLAIM " + record, flush=True)
     finally:
         worker.close()

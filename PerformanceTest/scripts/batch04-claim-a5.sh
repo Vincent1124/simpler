@@ -12,7 +12,8 @@ mkdir "$output"
 mkdir "$output/ascend"
 export ASCEND_PROCESS_LOG_PATH="$PWD/$output/ascend"
 export SIMPLER_RESIDENT_PERF=off
+export BATCH04_CLAIM_OUTPUT="$PWD/$output"
 python -m pytest PerformanceTest/cases/test_ready_claim_a5.py --platform a5 --device "$TASK_DEVICE" -vv -s 2>&1 | tee "$output/run.log"
-rg -o 'BATCH04_CLAIM \{.*\}' "$output/run.log" > "$output/measurements.jsonl"
+cat "$output/core-0.jsonl" "$output/core-1.jsonl" > "$output/measurements.jsonl"
 test "$(wc -l < "$output/measurements.jsonl")" -eq 160
 date -Iseconds > "$output/COMPLETED"
