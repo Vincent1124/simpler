@@ -1681,7 +1681,7 @@ inline __aicore__ bool scheduler_ready_pool_claim(
         const uint64_t pop_start = scheduler_measure_begin(local->measurement, SchedulerMeasureTimer::POP);
         if (placement == nullptr) {
             result = scheduler_ticket_try_pop(
-                queue, &ref, 1,
+                queue, &ref, 2,
                 local->measurement != nullptr ? &measured_retries :
                 stats == nullptr              ? nullptr :
                                                 &stats->cas_retry_count

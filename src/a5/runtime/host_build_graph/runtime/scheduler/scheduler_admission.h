@@ -392,7 +392,8 @@ static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
         return SchedulerAdmissionResult::ERROR;
     }
     scheduler_measure_add(local->measurement, SchedulerMeasureCounter::ADMISSION_ATTEMPT);
-    if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0) {
+    if (scheduler_gm_query(shared->commit_lock) != 0 ||
+        scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0) {
         scheduler_measure_add(local->measurement, SchedulerMeasureCounter::ADMISSION_FAILURE);
         return SchedulerAdmissionResult::RETRY;
     }
