@@ -77,6 +77,7 @@ int main() {
         alternating.push_back(groups[1][i]);
     }
     check("alternating", alternating);
+    check("short-alternating", {alternating.begin(), alternating.begin() + 4});
     check("same-group", {groups[0].begin(), groups[0].begin() + 10});
     check("singleton", {groups[0][0]});
 }

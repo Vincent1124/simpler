@@ -1306,8 +1306,11 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
     if (batch->count == 0 || batch->count > pool.task_count) return false;
     int64_t current = batch->head;
     uint64_t remaining = batch->count;
+    const bool coalesce = pool.kind == SchedulerReadyPoolKind::TICKET && remaining >= 8;
     while (remaining != 0) {
         if (!scheduler_task_ref_valid(*local->config.graph, current)) return false;
+        const uint32_t groups = pool.group_counts[type];
+        const uint32_t first_group = scheduler_ready_pool_ref_group(current, groups);
         int64_t refs[8]{};
         uint32_t count = 0;
         do {
@@ -1322,7 +1325,8 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
             --remaining;
             if (remaining == 0 && (current != batch->tail || next != SCHEDULER_INBOX_EMPTY)) return false;
             current = next;
-        } while (remaining != 0 && count < 8 && current >= 0);
+        } while (remaining != 0 && count < 8 && current >= 0 &&
+                 (coalesce || scheduler_ready_pool_ref_group(current, groups) == first_group));
         if (pool.kind != SchedulerReadyPoolKind::TICKET) {
             const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
             SchedulerLinkedBatch prepared{};
@@ -1337,10 +1341,8 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
                     SchedulerLinkedResult::SUCCESS)
                 return false;
         } else {
-            const uint32_t groups = pool.group_counts[type];
-            if (count == 1 || groups == 1) {
-                const uint32_t group = scheduler_ready_pool_ref_group(refs[0], groups);
-                const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
+            if (!coalesce || count == 1 || groups == 1) {
+                const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + first_group);
                 if (!scheduler_ready_pool_publish_ticket(local, queue, refs, count, stats)) return false;
                 continue;
             }

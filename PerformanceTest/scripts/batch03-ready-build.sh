@@ -7,7 +7,8 @@ base=0dc618f2b3581242f6b4a51bbfb36482ee249745
 cache_base=b4b0cefd09b7623946c657a0db4de64f4f4b5267
 ready=src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h
 lib=build/lib/a5/onboard/host_build_graph
-output=build/batch03-ready-ab
+output=${1:-build/batch03-ready-ab}
+[[ "$output" == build/batch03-ready-ab || "$output" == build/batch03-ready-selective ]]
 test "$(git diff --name-only "$base" HEAD -- src python simpler_setup tests/st/a5)" = "$ready"
 git diff --quiet -- src python simpler_setup tests/st/a5
 printf '%s  %s\n' 2262046192cbf0bb7057cdf786ce2099efc24f1eccd4e45624fce442de0efb96 "$lib/aicore_kernel.o" | sha256sum -c -
